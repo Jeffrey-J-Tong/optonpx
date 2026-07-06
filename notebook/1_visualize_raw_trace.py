@@ -4,14 +4,14 @@
 #%%
 # path and params
 from pathlib import Path
-base_path = Path(r"E:\D1-1-4_IM-1971\ephys_raw\2026-06-18_17-19-35_manualsurvey_shank1_bankAB")
+base_path = Path(r"E:\D1-1-4_IM-1971\ephys_raw\2026-06-19_14-59-14")
 # time range is relative to the start of ephys recording, instead of the time in timestamp
 # T_START = 26.8
 # T_END   = 27.8
 # T_START = 30.4
 # T_END   = 31.4
-T_START = 111.8
-T_END   = 112.8
+T_START = 1 * 60 + 51 + 0.8
+T_END   = T_START + 1
 save_dir = Path(r"C:\Users\Jeff\Downloads\output_optonpx")
 
 
@@ -43,7 +43,7 @@ fig = plot_electrode_map(probe["channel_electrode"], title=base_path.name)
 save_dir.mkdir(exist_ok=True)
 if ipython is not None:
     plt.show()
-fig.savefig(save_dir / f"{base_path.name}_channel_map.svg", bbox_inches="tight")
+fig.savefig(save_dir / f"{base_path.name}_channel_map.png", bbox_inches="tight", dpi=200)
 
 
 #%%
@@ -154,24 +154,27 @@ def plot_ephys_traces(data, t, groups, probe_params, channel_color,
 
 #%%
 # plot the raw trace (always in an independent window)
+print("Plotting the raw trace.")
 if ipython is not None:
     ipython.run_line_magic("matplotlib", "qt")
 data_valid = raw.data[:, raw.valid_slice]
 t_valid    = raw.t_arr[raw.valid_slice]
 data_plot  = data_valid - np.median(data_valid, axis=1, keepdims=True)
 figs = plot_ephys_traces(data_plot, t_valid, groups, probe, channel_color,
-                         special_channels=special_channels, offset_uv=400, title_suffix="raw",
+                         special_channels=special_channels, offset_uv=150, title_suffix="raw",
                          recording_name=base_path.name)
 for fig, sh, run in figs:
     if ipython is not None:
         plt.show()
-    fig.savefig(save_dir / f"{base_path.name}_sh{sh}_run{run}_raw.svg", bbox_inches="tight")
+    fig.savefig(save_dir / f"{base_path.name}_sh{sh}_run{run}_raw.png", bbox_inches="tight", dpi=200)
     if ipython is None:
         plt.close(fig)
+print("Raw trace figure is saved.")
 
 
 #%%
 # plot filtered LFP data
+print("Plotting LFP trace.")
 if ipython is not None:
     ipython.run_line_magic("matplotlib", "qt")
 from scipy.signal import butter, sosfiltfilt
@@ -180,18 +183,20 @@ sos_lp     = butter(4, LOWPASS_HZ, btype="lowpass", fs=raw.sample_rate, output="
 data_lfp   = sosfiltfilt(sos_lp, raw.data, axis=1).astype("float32")[:, raw.valid_slice]
 data_lfp  -= np.median(data_lfp, axis=1, keepdims=True)
 figs = plot_ephys_traces(data_lfp, t_valid, groups, probe, channel_color,
-                         special_channels=special_channels, offset_uv=500,
+                         special_channels=special_channels, offset_uv=150,
                          title_suffix=f"LFP, LP {LOWPASS_HZ:.0f} Hz",
                          recording_name=base_path.name)
 for fig, sh, run in figs:
     if ipython is not None:
         plt.show()
-    fig.savefig(save_dir / f"{base_path.name}_sh{sh}_run{run}_LFP_LP{LOWPASS_HZ:.0f}Hz.svg", bbox_inches="tight")
+    fig.savefig(save_dir / f"{base_path.name}_sh{sh}_run{run}_LFP_LP{LOWPASS_HZ:.0f}Hz.png", bbox_inches="tight", dpi=200)
     if ipython is None:
         plt.close(fig)
+print("LFP trace figure is saved.")
 
 #%%
 # plot filtered and CARed spike data
+print("Plotting the hipass trace.")
 if ipython is not None:
     ipython.run_line_magic("matplotlib", "qt")
 from scipy.signal import butter, sosfiltfilt
@@ -207,16 +212,16 @@ for runs in groups:
         data_car[ch_arr] -= data_filt[ch_arr].mean(axis=0)
 data_car -= np.median(data_car, axis=1, keepdims=True)
 figs = plot_ephys_traces(data_car, t_valid, groups, probe, channel_color,
-                         special_channels=special_channels, offset_uv=200,
+                         special_channels=special_channels, offset_uv=150,
                          title_suffix=f"HP {HIGHPASS_HZ:.0f} Hz + CAR",
                          recording_name=base_path.name)
 for fig, sh, run in figs:
     if ipython is not None:
         plt.show()
-    fig.savefig(save_dir / f"{base_path.name}_sh{sh}_run{run}_HP{HIGHPASS_HZ:.0f}Hz_CAR.svg", bbox_inches="tight")
+    fig.savefig(save_dir / f"{base_path.name}_sh{sh}_run{run}_HP{HIGHPASS_HZ:.0f}Hz_CAR.png", bbox_inches="tight", dpi=200)
     if ipython is None:
         plt.close(fig)
-    plt.show()
+print("Hipass trace figure is saved.")
 
 
 # %%

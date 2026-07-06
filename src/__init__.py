@@ -16,3 +16,4 @@ from src.probe import(
     find_contiguous_channel_groups,
 )
 from src.viz import plot_electrode_map
+from src.kilosort_helper import save_kilosort_channel_map
