@@ -341,6 +341,20 @@ def plot_probe_survey(electrodes, metric="peak_to_peak", title=None,
             ax.text(box_x0 - BANK_LABEL_OFFSET, (box_y0 + box_y1) / 2, bank, fontsize=9, fontweight="bold",
                     ha="right", va="center", fontfamily="monospace", color="#333333", zorder=4)
 
+            # thin dividers between the bank's 48-channel sections
+            sec_y_ranges = {}
+            for sec in range(N_SECTIONS):
+                locs = _structure[sh][bk][sec]
+                if not locs:
+                    continue
+                ys_sec = [(le // 2) * ROW_PITCH for le in locs]
+                sec_y_ranges[sec] = (min(ys_sec), max(ys_sec))
+            sorted_secs = sorted(sec_y_ranges.values())
+            for (_, lower_top), (upper_bot, _) in zip(sorted_secs, sorted_secs[1:]):
+                y_div = (lower_top + upper_bot) / 2
+                ax.plot([box_x0, box_x1], [y_div, y_div],
+                        color="#777777", linewidth=0.7, zorder=2)
+
             for sec in range(N_SECTIONS):
                 for parity in range(2):
                     items = []
@@ -382,78 +396,128 @@ def plot_probe_survey(electrodes, metric="peak_to_peak", title=None,
     return fig
 
 
-def plot_probe_survey_bank_summary(electrodes, metric="peak_to_peak", title=None):
+def plot_probe_survey_bank_summary(electrodes, metric="peak_to_peak", title=None,
+                                   central="median", xmax=None):
     """
-    Grouped box plot of a probe-survey metric per (shank, bank) — a quick
-    quantitative complement to plot_probe_survey for comparing banks.
+    Per-(shank, bank) grid of a probe-survey metric plotted against electrode
+    depth — a quantitative complement to plot_probe_survey's spatial heatmap
+    for deciding which bank to select on each shank.
+
+    One figure per probe. Columns are shanks (left to right); rows are banks
+    with bank A at the bottom and D at the top, and each row's height is
+    proportional to that bank's depth span. Within a cell the two electrode
+    columns form a mirrored ("butterfly") scatter about x = 0: column 0 to the
+    left (plotted at -value), column 1 to the right (+value). A dashed vertical
+    line marks each column's central value.
 
     Parameters
     ----------
     electrodes : list[dict]
         One probe's "electrodes" list from an Open Ephys probe-survey JSON.
+        Each dict must have "shank", "bank" (str "A".."D"), "column" (0/1),
+        "position_y_um", and the field named by `metric`. Electrodes with
+        "is_reference" true or "was_surveyed" false are skipped.
     metric : str
-        Key in each electrode dict to summarize (default "peak_to_peak").
+        Key in each electrode dict to plot on the x axis (default "peak_to_peak").
     title : str or None
+    central : {"median", "mean"}
+        Statistic for the per-column dashed lines (default "median").
+    xmax : float or None
+        Half-width of the symmetric x range, shared by every cell. None uses
+        the largest metric value over the probe's kept electrodes.
 
     Returns
     -------
     fig : matplotlib.figure.Figure
     """
-    shanks_sorted = sorted(set(e["shank"] for e in electrodes))
-    banks_sorted = sorted(set(e["bank"] for e in electrodes))
+    from matplotlib.ticker import FuncFormatter
 
-    fig, ax = plt.subplots(figsize=(2.2 * len(shanks_sorted) + 1.5, 5))
+    if central not in ("median", "mean"):
+        raise ValueError(f"central must be 'median' or 'mean', got {central!r}")
+    central_fn = np.median if central == "median" else np.mean
 
-    group_gap = 1.0
-    box_width = 0.7
-    positions, data, colors, tick_pos, tick_labels = [], [], [], [], []
-    bank_cmap = plt.get_cmap("tab10")
+    kept = [e for e in electrodes
+            if not e.get("is_reference", False) and e.get("was_surveyed", True)]
+    if not kept:
+        raise ValueError("no surveyed, non-reference electrodes to plot")
 
-    x = 0.0
-    for sh in shanks_sorted:
-        group_start = x
-        for bi, bank in enumerate(banks_sorted):
-            vals = [e[metric] for e in electrodes if e["shank"] == sh and e["bank"] == bank]
-            if not vals:
+    shanks_sorted = sorted(set(e["shank"] for e in kept))
+    banks_top_down = sorted(set(e["bank"] for e in kept), reverse=True)  # D..A
+    n_sh, n_bk = len(shanks_sorted), len(banks_top_down)
+
+    by_cell = {}                       # (bank, shank) -> list[electrode]
+    bank_yspan = {}                    # bank -> (ymin, ymax)
+    for e in kept:
+        by_cell.setdefault((e["bank"], e["shank"]), []).append(e)
+    for bank in banks_top_down:
+        ys = [e["position_y_um"] for e in kept if e["bank"] == bank]
+        bank_yspan[bank] = (min(ys), max(ys))
+
+    M = xmax if xmax is not None else max(e[metric] for e in kept)
+
+    AX_BG, MUTED, LINE_COL = "#f5f5f5", "#555555", "#b5333a"
+    height_ratios = [bank_yspan[b][1] - bank_yspan[b][0] or 1.0 for b in banks_top_down]
+
+    fig, axes = plt.subplots(
+        n_bk, n_sh, figsize=(2.6 * n_sh + 1.5, 13),
+        sharex=True, sharey="row", squeeze=False,
+        gridspec_kw={"height_ratios": height_ratios},
+        constrained_layout=True,
+    )
+    fig.patch.set_facecolor("white")
+
+    y_pad = 40
+    for r, bank in enumerate(banks_top_down):
+        ymin, ymax = bank_yspan[bank]
+        for c, sh in enumerate(shanks_sorted):
+            ax = axes[r][c]
+            cell = by_cell.get((bank, sh))
+            if not cell:
+                ax.set_axis_off()
                 continue
-            positions.append(x)
-            data.append(vals)
-            colors.append(bank_cmap(bi))
-            x += 1.0
-        tick_pos.append((group_start + x - 1.0) / 2)
-        tick_labels.append(f"Shank {sh}")
-        x += group_gap
 
-    bp = ax.boxplot(data, positions=positions, widths=box_width, patch_artist=True,
-                    showfliers=False)
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.7)
-    for median in bp["medians"]:
-        median.set_color("#222222")
+            ax.set_facecolor(AX_BG)
+            for spine in ("top", "right"):
+                ax.spines[spine].set_visible(False)
+            ax.tick_params(colors=MUTED, labelsize=7)
+            ax.axvline(0, color="#bbbbbb", linewidth=0.8, zorder=1)
 
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=9, color="#333333")
-    ax.set_ylabel(metric, fontsize=10, color="#555555")
-    ax.tick_params(axis="y", colors="#555555", labelsize=8)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
+            for col, sign in ((0, -1), (1, 1)):
+                pts = [e for e in cell if e["column"] == col]
+                if not pts:
+                    continue
+                xs = [sign * e[metric] for e in pts]
+                ys = [e["position_y_um"] for e in pts]
+                ax.scatter(xs, ys, s=3.5, alpha=0.55, linewidths=0,
+                           color="#1f4e79", zorder=2)
+                cval = sign * central_fn([e[metric] for e in pts])
+                ax.axvline(cval, color=LINE_COL, linewidth=1.1,
+                           linestyle="--", zorder=3)
 
-    handles = [mpatches.Patch(facecolor=bank_cmap(bi), alpha=0.7, label=bank)
-              for bi, bank in enumerate(banks_sorted)]
-    ax.legend(handles=handles, title="bank", fontsize=8, title_fontsize=8,
-             loc="upper right", frameon=False)
+            ax.set_xlim(-M, M)
+            ax.set_ylim(ymin - y_pad, ymax + y_pad)
 
+            if c == 0:
+                ax.set_ylabel(f"Bank {bank}", fontsize=10, fontweight="bold",
+                              color="#333333")
+            if r == 0:
+                ax.set_title(f"Shank {sh}", fontsize=9, color="#333333", pad=6)
+            if r == n_bk - 1:
+                ax.set_xlabel(metric, fontsize=10, color=MUTED)
+            ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _pos: f"{abs(x):g}"))
+
+    fig.supylabel("ypos (µm)", fontsize=10, color=MUTED)
     if title is not None:
-        fig.suptitle(title, color="#222222", fontsize=11, fontweight="bold")
+        fig.suptitle(f"{title}   (dashed = per-column {central})",
+                     color="#222222", fontsize=11, fontweight="bold")
 
-    fig.tight_layout()
     return fig
 
 
 def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
                                   cmap=OPENEPHYS_AMPLITUDE_CMAP, vmin=0, vmax=500,
-                                  width=230, height=820):
+                                  width=230, height=820, cbar_width=80, y_pad=150,
+                                  save_filename=None):
     """
     Interactive (Bokeh) version of plot_probe_survey: same per-shank spatial
     layout and color scale, but hovering an electrode shows its identifying
@@ -468,7 +532,19 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
     ----------
     electrodes, metric, title, cmap, vmin, vmax : see plot_probe_survey.
     width, height : int
-        Size in pixels of each per-shank sub-figure.
+        Size in pixels of each per-shank sub-figure's *data area* (frame). Set
+        as frame size rather than total size so the first shank -- the only one
+        carrying the y axis -- draws exactly as wide as the others.
+    cbar_width : int
+        Width in pixels of the colorbar column. The bar itself is drawn 14 px
+        wide and 35% of `height` tall.
+    y_pad : float
+        Blank margin in µm added above and below the electrodes' y range.
+    save_filename : str or None
+        Name the save button writes the PNG under (no extension). Defaults to a
+        slug of `title`. Setting it matters: with no filename BokehJS prompts
+        for one, and a sandboxed notebook iframe blocks the prompt, making the
+        button appear dead.
 
     Returns
     -------
@@ -476,9 +552,15 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         Display it as the last expression of a notebook cell (after calling
         bokeh.io.output_notebook() once), or bokeh.plotting.show(grid).
     """
+    import re
+    import warnings
+
     from bokeh.io import output_notebook
     from bokeh.layouts import gridplot
-    from bokeh.models import ColorBar, ColumnDataSource, HoverTool, Label, LinearColorMapper, Range1d
+    from bokeh.models import (
+        ColorBar, ColumnDataSource, HoverTool, Label, LinearColorMapper,
+        PanTool, Range1d, ResetTool, SaveTool, WheelZoomTool,
+    )
     from bokeh.plotting import figure
 
     from src.probe import ROW_PITCH, ELECTRODE_COL_XS
@@ -506,7 +588,6 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         by_shank[e["shank"]].append(e)
 
     all_ys = [e["row"] * ROW_PITCH for e in electrodes]
-    y_pad = 25
     y_range = Range1d(min(all_ys) - half_step - y_pad, max(all_ys) + half_step + y_pad)
     box_x0 = min(sh_xs) - BOX_X_PAD
     box_x1 = max(sh_xs) + BOX_X_PAD
@@ -516,6 +597,27 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         bk = BANK_LETTER_TO_INT[e["bank"]]
         local_e = e["row"] * 2 + e["column"]
         return _inv_map[e["shank"]][bk].get(local_e)
+
+    # Toolbar buttons: pan, reset, save. Pan is the default tool: dragging it
+    # pans the y axis and the mouse wheel zooms the y axis (a hidden wheel-zoom
+    # tool wired to active_scroll). The x axis (mirrored xpos + channel-label
+    # margins) stays fixed so the shank columns keep their alignment. Hover
+    # stays active but its toolbar toggle is hidden.
+    #
+    # Every figure gets its OWN tool instances -- a single Tool shared between
+    # plots only ever binds to the last one, so scrolling/dragging would work on
+    # just the rightmost shank. gridplot(merge_tools=True) then wraps each tool
+    # type in a ToolProxy that forwards to all of them.
+    #
+    # active_scroll MUST be set on each figure's own toolbar: it defaults to
+    # "auto", and BokehJS only auto-activates a wheel-zoom when the tool
+    # declares a keyboard modifier (WheelZoomTool.supports_auto() is
+    # `alt != null || ctrl != null || shift != null`). With no modifier, "auto"
+    # leaves it inactive -- which is why plain scrolling did nothing.
+    def _nav_tools():
+        return [PanTool(dimensions="height"),
+                WheelZoomTool(dimensions="height", visible=False),
+                ResetTool(), SaveTool()]
 
     figs = []
     for sh in shanks_sorted:
@@ -533,11 +635,17 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
             channel=[ch if ch is not None else "n/a" for ch in channels],
         ))
 
+        # frame_width/height (data area) rather than width/height (whole figure):
+        # only the first shank draws a y axis, and sizing by total width would
+        # make its data area narrower than the rest by the axis's width.
         fig = figure(
-            width=width, height=height, title=f"Shank {sh}",
+            frame_width=width, frame_height=height, title=f"Shank {sh}",
             x_range=x_range, y_range=y_range,
-            tools="pan,wheel_zoom,reset", background_fill_color="#f5f5f5",
+            tools=_nav_tools(), background_fill_color="#f5f5f5",
         )
+        fig.toolbar.logo = None
+        fig.toolbar.active_drag = next(t for t in fig.tools if isinstance(t, PanTool))
+        fig.toolbar.active_scroll = next(t for t in fig.tools if isinstance(t, WheelZoomTool))
         fig.yaxis.visible = sh == shanks_sorted[0]   # avoid redundant tick labels
 
         for bank in banks_sorted:
@@ -555,11 +663,26 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
                 text_color="#333333", text_font="monospace",
             ))
 
+            # thin dividers between the bank's 48-channel sections
+            bk = BANK_LETTER_TO_INT[bank]
+            sec_ranges = []
+            for sec in range(N_SECTIONS):
+                locs = _structure[sh][bk][sec]
+                if not locs:
+                    continue
+                ys_sec = [(le // 2) * ROW_PITCH for le in locs]
+                sec_ranges.append((min(ys_sec), max(ys_sec)))
+            sec_ranges.sort()
+            for (_, lower_top), (upper_bot, _) in zip(sec_ranges, sec_ranges[1:]):
+                y_div = (lower_top + upper_bot) / 2
+                fig.line([box_x0, box_x1], [y_div, y_div],
+                         line_color="#777777", line_width=0.7)
+
         renderer = fig.rect(
             "x", "y", width=RECT_W, height=RECT_H, source=src,
             fill_color={"field": "value", "transform": color_mapper}, line_color=None,
         )
-        fig.add_tools(HoverTool(renderers=[renderer], tooltips=[
+        fig.add_tools(HoverTool(renderers=[renderer], visible=False, tooltips=[
             ("channel", "@channel"),
             ("electrode", "@global_index"),
             ("shank / bank", "@shank / @bank"),
@@ -573,15 +696,47 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         figs.append(fig)
 
     # dedicated colorbar-only figure so it never steals width from a shank
-    # subplot (which would leave that one narrower / off-center vs the rest)
-    cbar_fig = figure(width=90, height=height, toolbar_location=None,
+    # subplot (which would leave that one narrower / off-center vs the rest).
+    # The bar itself is given an explicit size -- left to auto it stretches to
+    # the full 800+ px figure height, which dwarfs the shank plots.
+    cbar_fig = figure(frame_width=cbar_width, frame_height=height,
+                      toolbar_location=None, tools="",
                       outline_line_color=None, background_fill_color=None)
     cbar_fig.axis.visible = False
     cbar_fig.grid.visible = False
-    cbar_fig.add_layout(ColorBar(color_mapper=color_mapper, label_standoff=8, title=metric), "right")
+    cbar_fig.add_layout(ColorBar(
+        color_mapper=color_mapper, title=metric,
+        width=14, height=int(height * 0.35), label_standoff=6,
+        major_label_text_font_size="9px", title_text_font_size="10px",
+        title_text_font_style="normal", padding=0, border_line_color=None,
+        background_fill_alpha=0,
+    ), "right")
     figs.append(cbar_fig)
 
-    grid = gridplot([figs], toolbar_location="above")
+    # Each figure legitimately carries its own active_drag / active_scroll tool,
+    # so merging warns about "competing values" -- expected, not a problem.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*competing values.*")
+        grid = gridplot([figs], toolbar_location="above", merge_tools=True,
+                        toolbar_options={"logo": None})
+    # merge_tools wraps each tool type in a ToolProxy; point the merged toolbar's
+    # active gestures at those proxies so its buttons reflect the active tools.
+    #
+    # SaveTool is the exception: bokeh's merge discards the per-figure instances
+    # and builds a fresh SaveTool() for the whole grid, so `filename` has to be
+    # set here. Without it BokehJS falls back to prompt("Enter filename"), and a
+    # sandboxed notebook iframe (VS Code / JupyterLab, no allow-modals) returns
+    # null from prompt() -- the click then silently does nothing.
+    for _proxy in grid.toolbar.tools:
+        _inner = getattr(_proxy, "tools", [_proxy])
+        if any(isinstance(t, PanTool) for t in _inner):
+            grid.toolbar.active_drag = _proxy
+        elif any(isinstance(t, WheelZoomTool) for t in _inner):
+            grid.toolbar.active_scroll = _proxy
+        elif isinstance(_proxy, SaveTool):
+            _proxy.filename = save_filename or re.sub(
+                r"[^A-Za-z0-9._-]+", "_", title or f"probe_survey_{metric}"
+            ).strip("_")
     if title is not None:
         from bokeh.layouts import column
         from bokeh.models import Div
