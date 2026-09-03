@@ -15,5 +15,16 @@ from src.probe import(
     parse_imro_np2_multishank,
     find_contiguous_channel_groups,
 )
-from src.viz import plot_electrode_map
+from src.viz import (
+    plot_electrode_map,
+    plot_probe_survey,
+    plot_probe_survey_bank_summary,
+    plot_probe_survey_interactive,
+)
 from src.kilosort_helper import save_kilosort_channel_map
+from src.region_map import (
+    BRAIN_REGIONS,
+    build_region_assignment_app,
+    save_region_assignment,
+    load_region_assignment,
+)

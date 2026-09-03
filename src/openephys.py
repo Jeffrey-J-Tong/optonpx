@@ -257,7 +257,26 @@ def oe_parse_xml_params(xml_path: Path):
                 "channel_count": node_stream.attrib.get("channel_count"),
             })
 
-    for i, node_stream in enumerate(root.findall(".//NP_PROBE")):
+    # <NP_PROBE> is searched globally because it lives under the editor's
+    # <CUSTOM_PARAMETERS>, not nested under its <STREAM>. A OneBox port can have
+    # a probe plugged into each of its two docks, but only one may actually be
+    # enabled and streaming — OE still writes an <NP_PROBE> entry (with
+    # isEnabled="0") for the disabled one, so it must be filtered out before
+    # matching by position against probes_params (built from actual <STREAM>
+    # nodes), or the two lists silently go out of lockstep.
+    np_probe_nodes = [
+        n for n in root.findall(".//NP_PROBE") if n.attrib.get("isEnabled", "1") != "0"
+    ]
+    if len(np_probe_nodes) != len(probes_params):
+        raise ValueError(
+            f"Mismatch between enabled <NP_PROBE> nodes ({len(np_probe_nodes)}) and "
+            f"probe streams ({len(probes_params)}) in {xml_path}:\n"
+            f"  enabled NP_PROBE (port, dock): "
+            f"{[(n.attrib.get('port'), n.attrib.get('dock')) for n in np_probe_nodes]}\n"
+            f"  probe streams: {[p['stream_name'] for p in probes_params]}"
+        )
+
+    for i, node_stream in enumerate(np_probe_nodes):
         # pprint(f"Node tag: {node_stream.tag}")
         # pprint(f"Node attributes: {node_stream.attrib}")
         node_channels = node_stream.find("CHANNELS")  # channels are "bank:shank"
