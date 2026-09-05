@@ -260,7 +260,8 @@ def plot_probe_survey(electrodes, metric="peak_to_peak", title=None,
     RECT_W, RECT_H = 10, 10
     BOX_X_PAD = 16
     LABEL_MARGIN = 34    # reserved on BOTH sides, for channel-number + bank-letter text
-    BANK_LABEL_OFFSET = 16   # extra left offset so the bank letter clears the channel-number column
+    BANK_LABEL_OFFSET = 20   # extra left offset so the bank letter clears the section-letter column
+    SECTION_LABEL_OFFSET = 13   # between BANK_LABEL_OFFSET and the channel-number column, its own lane
     LABEL_INSET = 3 * ROW_PITCH
 
     banks_sorted = sorted(set(e["bank"] for e in electrodes))
@@ -354,6 +355,17 @@ def plot_probe_survey(electrodes, metric="peak_to_peak", title=None,
                 y_div = (lower_top + upper_bot) / 2
                 ax.plot([box_x0, box_x1], [y_div, y_div],
                         color="#777777", linewidth=0.7, zorder=2)
+
+            # per-section letter tags (a, b, c... in increasing-channel-number
+            # order, restarting at "a" for each bank). The same section index
+            # lands on a different depth on every shank -- matching letters
+            # across shank columns show which physical channel ranges (a
+            # fixed 48-channel group, or fewer on bank D's partial sections)
+            # correspond to each other.
+            for sec, (y0, y1) in sec_y_ranges.items():
+                letter = chr(ord("a") + sec)
+                ax.text(box_x0 - SECTION_LABEL_OFFSET, (y0 + y1) / 2, letter, fontsize=7, fontweight="bold",
+                        ha="right", va="center", fontfamily="monospace", color="#333333", zorder=4)
 
             for sec in range(N_SECTIONS):
                 for parity in range(2):
@@ -516,12 +528,14 @@ def plot_probe_survey_bank_summary(electrodes, metric="peak_to_peak", title=None
 
 def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
                                   cmap=OPENEPHYS_AMPLITUDE_CMAP, vmin=0, vmax=500,
-                                  width=230, height=820, cbar_width=80, y_pad=150,
+                                  width=230, height=820, y_pad=150,
                                   save_filename=None):
     """
     Interactive (Bokeh) version of plot_probe_survey: same per-shank spatial
-    layout and color scale, but hovering an electrode shows its identifying
-    info — shank, bank, row/column, survey's global_index, the real hardware
+    layout, color scale, and per-section start/end channel-number labels, but
+    hovering an electrode shows its identifying
+    info — shank, bank, row/column, the survey's probe-wide `global_index` and
+    the shank-local electrode index (0..ELEC_PER_SHANK-1), the real hardware
     channel number (the channel that would read this electrode if this bank
     were selected on this shank — same lookup table plot_electrode_map/
     plot_imro use, from probe.py's spreadsheet; None where a slot has no
@@ -535,9 +549,6 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         Size in pixels of each per-shank sub-figure's *data area* (frame). Set
         as frame size rather than total size so the first shank -- the only one
         carrying the y axis -- draws exactly as wide as the others.
-    cbar_width : int
-        Width in pixels of the colorbar column. The bar itself is drawn 14 px
-        wide and 35% of `height` tall.
     y_pad : float
         Blank margin in µm added above and below the electrodes' y range.
     save_filename : str or None
@@ -568,7 +579,10 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
     output_notebook(hide_banner=True)
 
     BOX_X_PAD = 16
-    LABEL_MARGIN = 30   # reserved on BOTH sides -> box stays centered in x_range
+    LABEL_MARGIN = 34    # reserved on BOTH sides, for channel-number + bank-letter text
+    BANK_LABEL_OFFSET = 20   # extra left offset so the bank letter clears the section-letter column
+    SECTION_LABEL_OFFSET = 13   # between BANK_LABEL_OFFSET and the channel-number column, its own lane
+    LABEL_INSET = 3 * ROW_PITCH
     RECT_W, RECT_H = 10, 10
     half_step = ROW_PITCH / 2
     sh_xs = ELECTRODE_COL_XS
@@ -593,10 +607,14 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
     box_x1 = max(sh_xs) + BOX_X_PAD
     x_range = (box_x0 - LABEL_MARGIN, box_x1 + LABEL_MARGIN)
 
+    def _local_index(e):
+        """Electrode index within its own shank, 0..ELEC_PER_SHANK-1 -- probe.py's
+        "local electrode" convention (global = shank * ELEC_PER_SHANK + local)."""
+        return e["row"] * 2 + e["column"]
+
     def _channel_for(e):
         bk = BANK_LETTER_TO_INT[e["bank"]]
-        local_e = e["row"] * 2 + e["column"]
-        return _inv_map[e["shank"]][bk].get(local_e)
+        return _inv_map[e["shank"]][bk].get(_local_index(e))
 
     # Toolbar buttons: pan, reset, save. Pan is the default tool: dragging it
     # pans the y axis and the mouse wheel zooms the y axis (a hidden wheel-zoom
@@ -632,6 +650,7 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
             row=[e["row"] for e in sh_electrodes],
             column=[e["column"] for e in sh_electrodes],
             global_index=[e.get("global_index") for e in sh_electrodes],
+            local_index=[_local_index(e) for e in sh_electrodes],
             channel=[ch if ch is not None else "n/a" for ch in channels],
         ))
 
@@ -647,6 +666,7 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         fig.toolbar.active_drag = next(t for t in fig.tools if isinstance(t, PanTool))
         fig.toolbar.active_scroll = next(t for t in fig.tools if isinstance(t, WheelZoomTool))
         fig.yaxis.visible = sh == shanks_sorted[0]   # avoid redundant tick labels
+        fig.grid.visible = False   # default gridlines would clutter the section dividers below
 
         for bank in banks_sorted:
             bank_es = [e for e in sh_electrodes if e["bank"] == bank]
@@ -657,7 +677,7 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
             fig.quad(left=box_x0, right=box_x1, top=box_y1, bottom=box_y0,
                      fill_color=None, line_color="#444444", line_width=1.8)
             fig.add_layout(Label(
-                x=box_x0 - 2, y=(box_y0 + box_y1) / 2, text=bank,
+                x=box_x0 - BANK_LABEL_OFFSET, y=(box_y0 + box_y1) / 2, text=bank,
                 text_align="right", text_baseline="middle",
                 text_font_size="9pt", text_font_style="bold",
                 text_color="#333333", text_font="monospace",
@@ -665,18 +685,67 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
 
             # thin dividers between the bank's 48-channel sections
             bk = BANK_LETTER_TO_INT[bank]
-            sec_ranges = []
+            sec_y_ranges = {}
             for sec in range(N_SECTIONS):
                 locs = _structure[sh][bk][sec]
                 if not locs:
                     continue
                 ys_sec = [(le // 2) * ROW_PITCH for le in locs]
-                sec_ranges.append((min(ys_sec), max(ys_sec)))
-            sec_ranges.sort()
-            for (_, lower_top), (upper_bot, _) in zip(sec_ranges, sec_ranges[1:]):
+                sec_y_ranges[sec] = (min(ys_sec), max(ys_sec))
+            sorted_secs = sorted(sec_y_ranges.values())
+            for (_, lower_top), (upper_bot, _) in zip(sorted_secs, sorted_secs[1:]):
                 y_div = (lower_top + upper_bot) / 2
                 fig.line([box_x0, box_x1], [y_div, y_div],
                          line_color="#777777", line_width=0.7)
+
+            # per-section letter tags (a, b, c... in increasing-channel-number
+            # order, restarting at "a" for each bank). The same section index
+            # lands on a different depth on every shank -- matching letters
+            # across shank columns show which physical channel ranges (a
+            # fixed 48-channel group, or fewer on bank D's partial sections)
+            # correspond to each other.
+            for sec, (y0, y1) in sec_y_ranges.items():
+                letter = chr(ord("a") + sec)
+                fig.add_layout(Label(
+                    x=box_x0 - SECTION_LABEL_OFFSET, y=(y0 + y1) / 2, text=letter,
+                    text_align="right", text_baseline="middle",
+                    text_font_size="7pt", text_font_style="bold",
+                    text_color="#333333", text_font="monospace",
+                ))
+
+            # real hardware channel numbers (top/bottom channel per section,
+            # both column parities) -- same source plot_probe_survey/
+            # plot_electrode_map/plot_imro use: the channel that would read
+            # this electrode if this bank were selected on this shank.
+            for sec in range(N_SECTIONS):
+                for parity in range(2):
+                    items = []
+                    for local_e in _structure[sh][bk][sec]:
+                        if local_e % 2 != parity:
+                            continue
+                        ch = _inv_map[sh][bk].get(local_e)
+                        if ch is None:
+                            continue
+                        items.append(((local_e // 2) * ROW_PITCH, ch))
+                    if not items:
+                        continue
+                    items.sort()
+                    y_label_bot = items[0][0] + LABEL_INSET
+                    y_label_top = items[-1][0] - LABEL_INSET
+                    lx = box_x0 - 2 if parity == 0 else box_x1 + 2
+                    text_align = "right" if parity == 0 else "left"
+                    fig.add_layout(Label(
+                        x=lx, y=y_label_bot, text=str(items[0][1]),
+                        text_align=text_align, text_baseline="middle",
+                        text_font_size="6pt", text_font_style="bold",
+                        text_color="#333333", text_font="monospace",
+                    ))
+                    fig.add_layout(Label(
+                        x=lx, y=y_label_top, text=str(items[-1][1]),
+                        text_align=text_align, text_baseline="middle",
+                        text_font_size="6pt", text_font_style="bold",
+                        text_color="#333333", text_font="monospace",
+                    ))
 
         renderer = fig.rect(
             "x", "y", width=RECT_W, height=RECT_H, source=src,
@@ -684,7 +753,8 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         )
         fig.add_tools(HoverTool(renderers=[renderer], visible=False, tooltips=[
             ("channel", "@channel"),
-            ("electrode", "@global_index"),
+            ("electrode (global)", "@global_index"),
+            ("electrode (shank-local)", "@local_index"),
             ("shank / bank", "@shank / @bank"),
             ("row, col", "@row, @column"),
             (metric, "@value{0.0}"),
@@ -697,19 +767,27 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
 
     # dedicated colorbar-only figure so it never steals width from a shank
     # subplot (which would leave that one narrower / off-center vs the rest).
-    # The bar itself is given an explicit size -- left to auto it stretches to
-    # the full 800+ px figure height, which dwarfs the shank plots.
-    cbar_fig = figure(frame_width=cbar_width, frame_height=height,
+    # A full-height bar, matching plot_probe_survey's fig.colorbar(cax=...).
+    #
+    # The ColorBar itself is added to this figure's "right" panel -- a strip
+    # that BokehJS lays out just outside the figure's own frame, sized to fit
+    # the bar/ticks/title, independent of frame_width. So frame_width only
+    # needs to be just wide enough to read as its own grid cell; making it
+    # the visible bar's width (as a `cbar_width` parameter once did) just
+    # padded blank space in between it and the last shank.
+    cbar_fig = figure(frame_width=2, frame_height=height,
                       toolbar_location=None, tools="",
                       outline_line_color=None, background_fill_color=None)
     cbar_fig.axis.visible = False
     cbar_fig.grid.visible = False
     cbar_fig.add_layout(ColorBar(
         color_mapper=color_mapper, title=metric,
-        width=14, height=int(height * 0.35), label_standoff=6,
-        major_label_text_font_size="9px", title_text_font_size="10px",
-        title_text_font_style="normal", padding=0, border_line_color=None,
-        background_fill_alpha=0,
+        width=14, height=height - 40, label_standoff=6,
+        title_standoff=8,
+        major_label_text_font_size="10px", major_label_text_color="#555555",
+        title_text_font_size="11px", title_text_font_style="normal",
+        title_text_color="#555555",
+        padding=0, border_line_color=None, background_fill_alpha=0,
     ), "right")
     figs.append(cbar_fig)
 
@@ -719,6 +797,11 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         warnings.filterwarnings("ignore", message=".*competing values.*")
         grid = gridplot([figs], toolbar_location="above", merge_tools=True,
                         toolbar_options={"logo": None})
+    # gridplot's own background is transparent, so the thin gaps between cells
+    # normally just show the page behind it -- fine on a white notebook, but a
+    # dark VS Code/Jupyter theme shows through as a black bar between the
+    # shank plots and the colorbar. Force it white to match the figures.
+    grid.styles = {"background-color": "white"}
     # merge_tools wraps each tool type in a ToolProxy; point the merged toolbar's
     # active gestures at those proxies so its buttons reflect the active tools.
     #
@@ -741,5 +824,5 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         from bokeh.layouts import column
         from bokeh.models import Div
         header = Div(text=f"<b>{title}</b>", styles={"font-size": "13pt", "color": "#222222"})
-        return column(header, grid)
+        return column(header, grid, styles={"background-color": "white"})
     return grid
