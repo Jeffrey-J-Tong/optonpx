@@ -1,0 +1,18 @@
+# One session YAML per raw Open Ephys recording folder. This one: the hex maze
+# behavior recording. See metadata/README.md for the full schema.
+
+session_id: IM-1971_2026-06-19_behavior
+animal: IM-1971
+date: 2026-06-19
+session_type: behavior            # behavior | optotagging
+description: "Hex maze task"
+
+open_ephys:
+  folder_path: 'E:\D1-1-4_IM-1971\ephys_raw\2026-06-19_14-59-14'
+  # experiment_number: 1          # optional; auto-detected when omitted
+
+probe_streams: [ProbeA]           # ephys stream name(s) to concatenate
+
+adc:                              # column index into the OneBox-ADC stream (= the "ADCn" number)
+  sync_1hz: 0
+  port_visits: 2

@@ -1,0 +1,65 @@
+animal: D1-1-6_IM-1979
+date: 2026-09-04
+
+sessions:
+  behavior: "2026-09-04_14-20-43"
+  optotagging: "2026-09-04_16-39-38"
+  processed: "2026-09-04"
+
+streams:
+  probes:
+    - probeA
+    - probeB
+  adc: OneBox-ADC
+
+adc:
+  threshold_volts: 2
+  channels:
+    sync:       0
+    blue_laser: 1
+    behavior:   2
+    red_laser:  3
+
+probeA:
+  preprocess:
+    concatenate: ["behavior", "optotagging"]
+    phase_shift:
+      apply: true
+      margin_ms: 40                   # FFT edge context per chunk
+      chunk_s: 10                     # samples per streamed chunk (tune for RAM)
+    mask_laser_artifact:
+      apply: true
+      pre_on_ms:  0.1
+      post_on_ms: 1.0
+      pre_off_ms: 0.1
+      post_off_ms: 1.0
+      method: linear        # linear | zero
+    car: 
+      apply: false           # this should always be false, we let kilosort do CAR
+  kilosort_params:
+    bad_channels: []
+    do_car: true
+    Th: []
+    output_dir: kilosort4
+
+probeB:
+  preprocess:
+    concatenate: ["behavior", "optotagging"]
+    phase_shift:
+      apply: true
+      margin_ms: 40                   # FFT edge context per chunk
+      chunk_s: 10                     # samples per streamed chunk (tune for RAM)
+    mask_laser_artifact:
+      apply: true
+      pre_on_ms:  0.1
+      post_on_ms: 1.0
+      pre_off_ms: 0.1
+      post_off_ms: 1.0
+      method: linear        # linear | zero
+    car:
+      apply: false
+  kilosort_params:
+    bad_channels: []
+    do_car: true
+    Th: []
+    output_dir: kilosort4

@@ -1,0 +1,105 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Experiment metadata — one file per animal per recording day.
+#
+# All raw-data paths are RELATIVE to `data_root`; the loader joins them at call
+# time. Raw recordings are never modified — every processing output goes under
+# `output_dir`.
+#
+# Per-stage parameters (preprocess / optotagging / sorting) are given per probe,
+# then per shank: a `defaults` block that applies to all 4 shanks, plus optional
+# per-shank overrides under `shanks:`. A shank with `optotagging.enabled: false`
+# (the default) is simply not optotagged.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+animal: IM-1971
+date: 2026-06-19
+description: "Hex maze behavior + optotagging survey (D1-Cre)"
+
+# ─── 1. raw data location ────────────────────────────────────────────────────
+# data_root + each session's `path` = an Open Ephys session folder (the one that
+# contains "Record Node .../experiment.../recording...").
+data_root: 'E:\D1-1-4_IM-1971\ephys_raw'
+
+sessions:
+  behavior:     {path: '2026-06-19_14-59-14'}   # -> E:\D1-1-4_IM-1971\ephys_raw\2026-06-19_14-59-14
+  optotagging:  {path: '2026-06-19_15-40-02'}
+
+# order for the combined spike sort spanning both sessions. Keep behavior first:
+# its spike sample indices then need no offset when the sort is split back per
+# session (jdb_to_nwb checks the behavior analyzer's sample count).
+concatenate: [behavior, optotagging]
+
+# processing output — relative to data_root, or an absolute path
+output_dir: 'concatenated_2026-06-19'
+
+# ─── 2. OneBox-ADC channel roles ────────────────────────────────────────────
+# role  ->  column index in the OneBox-ADC stream (the "ADCn" number).
+# Only the channels actually used need to appear.
+adc_roles:
+  sync:        0      # 1 Hz sync clock
+  blue_laser:  1
+  behavior:    2      # behavior / port-visit sync
+  red_laser:   3
+
+# ─── 3. probes + per-shank processing parameters ────────────────────────────
+# The keys under `probes:` ARE the Open Ephys stream names to process.
+probes:
+
+  ProbeA:
+
+    # NP2.0 inter-channel phase-shift correction. Per-channel hardware property,
+    # not a per-shank knob — lives at the probe level.
+    phase_shift: {apply: true, margin_ms: 40, chunk_s: 10}
+
+    # `defaults` applies to every shank; `shanks: <n>:` overrides it for shank n.
+    defaults:
+
+      preprocess:              # used by 2.2_concatenate_sessions
+        # blank the optogenetic light artifact on this shank's channels during
+        # laser pulses. Only meaningful where the light actually reaches.
+        mask_laser_artifact: false
+        mask:
+          pre_on_ms:  0.1
+          post_on_ms: 1.0
+          pre_off_ms: 0.1
+          post_off_ms: 1.0
+          method: linear        # linear | zero
+
+      optotagging:              # used by the optotagging analysis (later)
+        enabled: false
+
+      sorting:                  # used by 3.1 (channel map) + 3.2 (run kilosort), later
+        bad_channels: []        # 0-indexed, OpenEphys numbering
+        do_CAR: true            # off for hippocampal shanks
+        Th: [9.0, 8.0]          # [Th_universal, Th_learned]
+
+    shanks:
+
+      # ── worked example: shank 2 is the optotagged one ──────────────────────
+      # TODO: replace with the shank(s) actually under the fibre for IM-1971.
+      2:
+        preprocess:
+          mask_laser_artifact: true
+
+        optotagging:
+          enabled: true
+          lasers: [blue_laser, red_laser]     # which `adc_roles` lasers illuminate this shank
+          pulse_detection:                    # -> detect_laser_pulses
+            threshold_volts: 2.0
+            polarity: positive
+            min_width_ms: 5.0
+            max_width_ms: 30.0
+            min_interpulse_ms: 50.0
+          lag_estimation:                     # -> estimate_artifact_lag
+            probe_channel: 80                 # 0-indexed; must be a channel ON this shank
+            search_window_ms: [-5, 8]
+            artifact_sign: negative
+            max_pulses: 200
+
+        sorting:
+          bad_channels: []
+
+      # ── other shanks: uncomment and fill in only what differs from defaults ──
+      # 0: {sorting: {bad_channels: []}}
+      # 1: {sorting: {bad_channels: []}}
+      # 3: {sorting: {bad_channels: []}}

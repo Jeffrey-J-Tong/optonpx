@@ -1,0 +1,22 @@
+# Merge recipe: defines one concatenated, Kilosort-ready recording built from
+# the session YAMLs below, in this order. notebook/2.2_concatenate_sessions.ipynb
+# reads this file. Put the behavior session first so its spike sample indices
+# need no offset when the sorting is later split back per session.
+
+merge_id: IM-1971_2026-06-19
+output_dir: 'E:\D1-1-4_IM-1971\ephys_raw\concatenated_2026-06-19'
+
+probe_streams: [ProbeA]           # one output continuous.dat per stream
+
+sessions:
+  - metadata: IM-1971_2026-06-19_behavior.yaml
+  - metadata: IM-1971_2026-06-19_optotagging.yaml
+
+phase_shift:
+  apply: true
+  margin_ms: 40                   # FFT edge context per chunk
+  chunk_s: 10                     # samples per streamed chunk (tune for RAM)
+
+kilosort_hint:                    # recorded in preprocessing.json only; this
+  do_car:                         # notebook does NOT run CAR (Kilosort does)
+    ProbeA: true

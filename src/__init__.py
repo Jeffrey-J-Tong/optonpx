@@ -5,6 +5,7 @@ from src.openephys import (
     oe_parse_oebin_params,
     oe_parse_params,
     oe_load_adc,
+    oe_load_adc_column,
     oe_detect_adc_events,
     oe_load_ephys_slice,
 )
@@ -22,6 +23,23 @@ from src.viz import (
     plot_probe_survey_interactive,
 )
 from src.kilosort_helper import save_kilosort_channel_map
+from src.optotagging import (
+    load_curated_sorting,
+    split_sorting_by_session,
+)
+from src.metadata import (
+    load_session_metadata,
+    load_merge_recipe,
+)
+from src.preprocess import (
+    npx2_sample_shifts,
+    phase_shift_chunk,
+    detect_laser_pulses,
+    estimate_artifact_lag,
+    build_mask_windows,
+    apply_ramp_mask,
+    write_concatenated_recording,
+)
 from src.region_map import (
     BRAIN_REGIONS,
     build_region_assignment_app,

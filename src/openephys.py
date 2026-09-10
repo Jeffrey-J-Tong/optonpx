@@ -97,6 +97,41 @@ def oe_load_adc(adc_dir, adc_params):
     return data, t_arr, sample_rate
 
 
+def oe_load_adc_column(adc_dir, adc_params, channel):
+    """
+    Load a single ADC channel in volts, without pulling the whole stream into
+    memory (the OneBox ADC can be several GB over a long session).
+
+    Parameters
+    ----------
+    adc_dir : Path
+        oe_paths["adc_stream"] — directory with continuous.dat and timestamps.npy.
+    adc_params : dict
+        Must have "channel_count", "channel_bit_volts", "sample_rate".
+    channel : int
+        0-indexed column into the ADC stream (matches the "ADCn" number).
+
+    Returns
+    -------
+    volts : np.ndarray, shape (n_samples,), float64
+    t_arr : np.ndarray, shape (n_samples,), float64, seconds (OE clock)
+    sample_rate : float
+    """
+    adc_dir = Path(adc_dir)
+    n_ch = int(adc_params["channel_count"])
+    bv   = float(adc_params["channel_bit_volts"])
+    if not 0 <= int(channel) < n_ch:
+        raise ValueError(f"ADC channel {channel} out of range (stream has {n_ch} channels)")
+
+    raw = np.memmap(adc_dir / "continuous.dat", dtype="int16", mode="r")
+    raw = raw.reshape(raw.size // n_ch, n_ch)
+    volts       = raw[:, int(channel)].astype("float64") * bv
+    t_arr       = np.load(adc_dir / "timestamps.npy").astype("float64")
+    sample_rate = float(adc_params["sample_rate"])
+
+    return volts, t_arr, sample_rate
+
+
 def oe_detect_adc_events(adc_data, adc_t, channel, threshold=4.0):
     """
     Detect threshold-crossing events in an ADC channel.
