@@ -826,3 +826,207 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
         header = Div(text=f"<b>{title}</b>", styles={"font-size": "13pt", "color": "#222222"})
         return column(header, grid, styles={"background-color": "white"})
     return grid
+
+
+# --------------------------------------------------------------------------- #
+# Optotagging: per-unit laser raster + PSTH, population summary
+# --------------------------------------------------------------------------- #
+
+def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
+                       window_ms=(-20.0, 30.0), bin_ms=1.0,
+                       response_window_ms=(1.0, 10.0), artifact_blank_ms=(0.0, 1.0),
+                       mark_blocks=True, block_gap_factor=3.0, psth_mode="stacked"):
+    """
+    Laser-onset-aligned spike raster (top) + PSTH(s) (below) for one unit, one
+    column per laser colour.
+
+    Parameters
+    ----------
+    sorting : spikeinterface BaseSorting
+        Spike trains in the same coordinate system as ``laser_events``'
+        ``on_sample_concat`` (i.e. the unsliced concatenated-axis sorting).
+    laser_events : pandas.DataFrame
+        As returned by ``src.optotagging.load_laser_events`` (already filtered
+        to one probe / the optotagging session), ideally after
+        ``annotate_laser_events_with_protocol`` (adds the ``power`` column).
+    unit_id : int
+        Unit to plot.
+    colors : list[str] | None
+        Laser colours to plot (columns). None = every colour in ``laser_events``.
+    window_ms : (start, end)
+        Time window around each pulse onset to show.
+    bin_ms : float
+        PSTH bin width.
+    response_window_ms, artifact_blank_ms : (start, end)
+        Shaded on every panel; also passed to ``compute_laser_response`` for the
+        per-block reliability / SALT p annotations.
+    mark_blocks : bool
+        Split the pulse train into blocks (power levels from the protocol
+        annotation, else pulse-rate blocks from
+        ``src.optotagging.laser_pulse_blocks``): dashed line + label per block
+        in the raster, and one PSTH per block.
+    block_gap_factor : float
+        Passed to ``laser_pulse_blocks`` (only used without a ``power`` column).
+    psth_mode : "stacked" | "overlay" | "pooled"
+        With blocks: "stacked" = one PSTH row per block; "overlay" = all blocks
+        as coloured step histograms in a single PSTH; "pooled" = a single PSTH
+        over all pulses of the colour. Ignored (always pooled) if there is only
+        one block.
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    from src.optotagging import compute_laser_response, laser_pulse_blocks
+
+    fs = sorting.get_sampling_frequency()
+    spike_times_s = sorting.get_unit_spike_train(unit_id).astype(float) / fs
+
+    if colors is None:
+        colors = list(laser_events["color"].unique())
+    lo_s, hi_s = window_ms[0] / 1000.0, window_ms[1] / 1000.0
+    edges_ms = np.arange(window_ms[0], window_ms[1] + bin_ms, bin_ms)
+
+    def resolve_blocks(color):
+        """(color_events, pulse_times_s, [(start_idx, end_idx, label)])."""
+        ce = laser_events[laser_events["color"] == color].sort_values("on_sample_concat")
+        pt = ce["on_sample_concat"].to_numpy(dtype=float) / fs
+        if not mark_blocks or len(pt) <= 2:
+            return ce, pt, [(0, len(pt), None)]
+        if "power" in ce.columns and ce["power"].notna().any():
+            power = ce["power"].to_numpy()
+            edges = np.flatnonzero(power[1:] != power[:-1]) + 1
+            starts = np.concatenate([[0], edges])
+            ends = np.concatenate([edges, [len(power)]])
+            return ce, pt, [(int(s), int(e), str(power[s])) for s, e in zip(starts, ends)]
+        blocks = laser_pulse_blocks(pt, gap_factor=block_gap_factor)
+        return ce, pt, [(s, e, f"{r:.0f} Hz" if np.isfinite(r) else None) for s, e, r in blocks]
+
+    per_color = {c: resolve_blocks(c) for c in colors}
+    n_blocks = max(len(v[2]) for v in per_color.values())
+    stacked = mark_blocks and psth_mode == "stacked" and n_blocks > 1
+
+    n_psth_rows = n_blocks if stacked else 1
+    height_ratios = [3] + [1] * n_psth_rows
+    fig, axes = plt.subplots(1 + n_psth_rows, len(colors),
+                             figsize=(5.0 * len(colors), 3.2 + 1.25 * n_psth_rows),
+                             squeeze=False, sharex=True,
+                             gridspec_kw={"height_ratios": height_ratios})
+    psth_axes = []
+
+    def block_response(pulse_subset_s):
+        return compute_laser_response(spike_times_s, pulse_subset_s,
+                                      response_window_ms=response_window_ms,
+                                      artifact_blank_ms=artifact_blank_ms)
+
+    def psth_rate(latencies_list):
+        allm = np.concatenate(latencies_list) if latencies_list else np.array([])
+        counts, _ = np.histogram(allm, bins=edges_ms)
+        return counts / (max(len(latencies_list), 1) * bin_ms / 1000.0)
+
+    for ci, color in enumerate(colors):
+        ce, pt, blocks = per_color[color]
+        per_trial_ms = [
+            (spike_times_s[(spike_times_s >= t0 + lo_s) & (spike_times_s < t0 + hi_s)] - t0) * 1000.0
+            for t0 in pt
+        ]
+
+        ax_r = axes[0, ci]
+        ax_r.eventplot(per_trial_ms, colors="black", lineoffsets=np.arange(len(per_trial_ms)),
+                       linelengths=0.8, linewidths=0.5)
+        ax_r.set(ylabel="laser pulse #", ylim=(len(per_trial_ms), -1))
+
+        if len(blocks) > 1:
+            for start_idx, end_idx, label in blocks:
+                if start_idx > 0:
+                    ax_r.axhline(start_idx - 0.5, ls="--", color="0.55", lw=0.9)
+                if label:
+                    ax_r.text(window_ms[0], (start_idx + end_idx) / 2, f" {label}",
+                              va="center", ha="left", fontsize=7, color="0.4")
+
+        if stacked:
+            for bi, (start_idx, end_idx, label) in enumerate(blocks):
+                ax = axes[1 + bi, ci]
+                psth_axes.append(ax)
+                ax.bar(edges_ms[:-1], psth_rate(per_trial_ms[start_idx:end_idx]),
+                       width=bin_ms, align="edge", color="0.4")
+                mb = block_response(pt[start_idx:end_idx])
+                ax.set_ylabel(f"{label or f'block {bi}'}\nHz", fontsize=8)
+                ax.text(0.98, 0.92, f"reliab {mb['reliability']:.2f} | p {mb['salt_p']:.2g}",
+                        transform=ax.transAxes, ha="right", va="top", fontsize=7, color="0.35")
+            for bi in range(len(blocks), n_psth_rows):
+                axes[1 + bi, ci].axis("off")
+        else:
+            ax_p = axes[1, ci]
+            psth_axes.append(ax_p)
+            if psth_mode == "overlay" and len(blocks) > 1:
+                ramp = plt.cm.viridis(np.linspace(0.1, 0.9, len(blocks)))
+                for bi, (start_idx, end_idx, label) in enumerate(blocks):
+                    mb = block_response(pt[start_idx:end_idx])
+                    ax_p.step(edges_ms[:-1], psth_rate(per_trial_ms[start_idx:end_idx]),
+                              where="post", color=ramp[bi], lw=1.3,
+                              label=f"{label or bi}  (r {mb['reliability']:.2f}, p {mb['salt_p']:.2g})")
+                ax_p.legend(fontsize=6, loc="upper right")
+            else:
+                ax_p.bar(edges_ms[:-1], psth_rate(per_trial_ms), width=bin_ms,
+                         align="edge", color="0.4")
+            ax_p.set_ylabel("rate (Hz)")
+
+        axes[-1, ci].set_xlabel("time from laser onset (ms)")
+
+        m = block_response(pt)
+        ax_r.set_title(
+            f"unit {unit_id} \u2014 {color}"
+            + ("  (per-power PSTHs below)" if len(blocks) > 1 and (stacked or psth_mode == "overlay")
+               else f"\nreliab {m['reliability']:.2f} | lat {m['median_latency_ms']:.1f} ms | "
+                    f"jitter {m['jitter_ms']:.1f} ms | SALT p {m['salt_p']:.3g}"),
+            fontsize=9,
+        )
+
+    for ax in axes.ravel():
+        if not ax.get_visible() or not ax.axison:
+            continue
+        ax.axvspan(*response_window_ms, color="tab:blue", alpha=0.12, lw=0)
+        if artifact_blank_ms[1] > artifact_blank_ms[0]:
+            ax.axvspan(*artifact_blank_ms, color="tab:red", alpha=0.15, lw=0)
+        ax.axvline(0, color="tab:blue", lw=0.8)
+    if psth_axes:
+        ymax = max((ax.get_ylim()[1] for ax in psth_axes), default=1.0)
+        for ax in psth_axes:
+            ax.set_ylim(0, ymax)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_opto_population(opto_df, *, x="reliability", y="median_latency_ms"):
+    """
+    Scatter of every unit's laser-response metrics, one panel per laser colour,
+    opto-tagged units highlighted.
+
+    Parameters
+    ----------
+    opto_df : pandas.DataFrame
+        As returned by ``src.optotagging.compute_population_opto_response``
+        (needs columns ``color``, ``is_tagged``, and ``x``/``y``).
+    x, y : str
+        Column names for the scatter axes.
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    colors = list(opto_df["color"].unique())
+    fig, axes = plt.subplots(1, len(colors), figsize=(5.0 * len(colors), 4.2),
+                             squeeze=False, sharex=True, sharey=True)
+    for ci, color in enumerate(colors):
+        d = opto_df[opto_df["color"] == color]
+        ax = axes[0, ci]
+        ax.scatter(d.loc[~d["is_tagged"], x], d.loc[~d["is_tagged"], y],
+                   s=14, c="0.7", label="not tagged")
+        ax.scatter(d.loc[d["is_tagged"], x], d.loc[d["is_tagged"], y],
+                   s=28, c="tab:red", label=f"tagged (n={int(d['is_tagged'].sum())})")
+        ax.set(xlabel=x, ylabel=y, title=color)
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    return fig

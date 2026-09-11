@@ -21,11 +21,21 @@ from src.viz import (
     plot_probe_survey,
     plot_probe_survey_bank_summary,
     plot_probe_survey_interactive,
+    plot_opto_response,
+    plot_opto_population,
 )
 from src.kilosort_helper import save_kilosort_channel_map
 from src.optotagging import (
     load_curated_sorting,
     split_sorting_by_session,
+    load_laser_events,
+    load_laser_protocol,
+    annotate_laser_events_with_protocol,
+    laser_pulse_blocks,
+    salt_test,
+    compute_laser_response,
+    is_optotagged,
+    compute_population_opto_response,
 )
 from src.metadata import (
     load_session_metadata,
