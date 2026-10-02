@@ -566,6 +566,8 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
     import re
     import warnings
 
+    from bokeh.core.validation import silence
+    from bokeh.core.validation.warnings import MISSING_RENDERERS
     from bokeh.io import output_notebook
     from bokeh.layouts import gridplot
     from bokeh.models import (
@@ -577,6 +579,11 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
     from src.probe import ROW_PITCH, ELECTRODE_COL_XS
 
     output_notebook(hide_banner=True)
+    # The colorbar-only figure below (cbar_fig) never gets a glyph renderer by
+    # design -- it only hosts a ColorBar annotation -- which trips Bokeh's
+    # "plot has no renderers" validation check on every show(). Silence that
+    # specific check; it's a false positive for this layout-only figure.
+    silence(MISSING_RENDERERS, True)
 
     BOX_X_PAD = 16
     LABEL_MARGIN = 34    # reserved on BOTH sides, for channel-number + bank-letter text

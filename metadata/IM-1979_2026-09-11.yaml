@@ -1,16 +1,18 @@
+# ======================================
 animal: D1-1-6_IM-1979
-date: 2026-09-04
+date: 2026-09-11
 
 sessions:
-  behavior: "2026-09-04_14-20-43"
-  optotagging: "2026-09-04_16-39-38"
-  processed: "2026-09-04"
+  behavior: "2026-09-11_14-50-36"
+  optotagging: "2026-09-11_16-29-36"
+  processed: "2026-09-11"
 
 streams:
   probes:
     - probeA
     - probeB
   adc: OneBox-ADC
+# ======================================
 
 adc:
   threshold_volts: 2
@@ -37,7 +39,7 @@ probeA:
     car: 
       apply: false           # this should always be false, we let kilosort do CAR
   kilosort_params:
-    bad_channels: [6, 90, 121, 137]
+    bad_channels: [6, 32, 72, 90, 121, 137]
     do_car: true
     Th: []
     output_dir: kilosort4
@@ -59,7 +61,7 @@ probeB:
     car:
       apply: false
   kilosort_params:
-    bad_channels: [2, 10, 54, 131, 218]
+    bad_channels: [2, 10, 54, 131]
     do_car: true
     Th: []
     output_dir: kilosort4
