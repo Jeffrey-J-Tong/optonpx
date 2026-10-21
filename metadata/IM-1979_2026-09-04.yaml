@@ -21,6 +21,8 @@ adc:
     red_laser:  3
 
 probeA:
+  target:
+    region: "dHPC"
   preprocess:
     concatenate: ["behavior", "optotagging"]
     phase_shift:
@@ -43,6 +45,8 @@ probeA:
     output_dir: kilosort4
 
 probeB:
+  target:
+    region: "NAc"
   preprocess:
     concatenate: ["behavior", "optotagging"]
     phase_shift:

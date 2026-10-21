@@ -6,13 +6,18 @@ notebook/2.2_concatenate_sessions_si.ipynb's session_boundaries.json), plus
 laser-response / optotagging classification (SALT test).
 """
 
+import ast
 import operator
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import spikeinterface.full as si
 from spikeinterface.core import BaseSorting
+from tqdm.auto import tqdm
+
+from src.waveform import evenly_spaced, mean_raw_waveform, open_raw_binary
 
 DEFAULT_UNIT_CRITERIA = {"quality": ["good"]}
 
@@ -193,7 +198,9 @@ def load_laser_protocol(csv_path) -> pd.DataFrame:
 
 
 def annotate_laser_events_with_protocol(laser_events: pd.DataFrame, protocol: pd.DataFrame, *,
-                                        gap_factor: float = 3.0) -> pd.DataFrame:
+                                        gap_factor: float = 3.0, fs: float | None = None,
+                                        width_tol_ms: float = 0.5,
+                                        freq_tol_frac: float = 0.05) -> pd.DataFrame:
     """
     Match each detected pulse block (per colour, in time order) to a row of
     ``protocol`` (per colour, in order) and tag every pulse with which block it
@@ -207,24 +214,32 @@ def annotate_laser_events_with_protocol(laser_events: pd.DataFrame, protocol: pd
         From load_laser_protocol.
     gap_factor : float
         Passed to laser_pulse_blocks for block detection.
+    fs : float | None
+        Sampling rate of on/off_sample_concat. When given, each block's measured
+        pulse width (median off - on) and rate (1 / median inter-pulse interval)
+        are checked against the protocol; None skips these checks.
+    width_tol_ms, freq_tol_frac : float
+        Tolerances for those checks (a mismatch only warns).
 
     Returns
     -------
     pandas.DataFrame
         Copy of laser_events with added columns: block (0-based index within
-        colour), power (note_power string), current, protocol_frequency_hz.
+        colour), power (note_power string), current, protocol_frequency_hz,
+        pulse_width_ms (the protocol's nominal pulse width).
 
     Raises
     ------
     ValueError
         If a colour's detected block count doesn't match the protocol, or a
-        block's pulse count is more than 10% off the protocol's `count`.
+        block's pulse count differs from the protocol's `count`.
     """
     out = laser_events.copy()
     out["block"] = -1
     out["power"] = None
     out["current"] = np.nan
     out["protocol_frequency_hz"] = np.nan
+    out["pulse_width_ms"] = np.nan
 
     for ev_color in sorted(laser_events["color"].unique()):
         proto_color = next((k for k, v in _PROTOCOL_COLOR_TO_EVENT.items() if v == ev_color), ev_color)
@@ -240,15 +255,29 @@ def annotate_laser_events_with_protocol(laser_events: pd.DataFrame, protocol: pd
         for bi, (start_idx, end_idx, _) in enumerate(blocks):
             row = proto.iloc[bi]
             n_pulses = end_idx - start_idx
-            if abs(n_pulses - row["count"]) > 0.1 * row["count"]:
+            if n_pulses != row["count"]:
                 raise ValueError(
                     f"{ev_color} block {bi}: {n_pulses} pulses vs protocol count {row['count']}"
                 )
             idx = g.index[start_idx:end_idx]
+
+            if fs is not None:
+                block = g.loc[idx]
+                width_ms = float(np.median(block["off_sample_concat"] - block["on_sample_concat"])) / fs * 1000.0
+                if abs(width_ms - row["pulse_width"]) > width_tol_ms:
+                    warnings.warn(f"{ev_color} block {bi}: measured pulse width {width_ms:.3f} ms vs "
+                                  f"protocol {row['pulse_width']} ms")
+                if n_pulses >= 2:
+                    rate_hz = fs / float(np.median(np.diff(block["on_sample_concat"].to_numpy())))
+                    if abs(rate_hz - row["frequency"]) > freq_tol_frac * row["frequency"]:
+                        warnings.warn(f"{ev_color} block {bi}: measured rate {rate_hz:.3f} Hz vs "
+                                      f"protocol {row['frequency']} Hz")
+
             out.loc[idx, "block"] = bi
             out.loc[idx, "power"] = row["note_power"]
             out.loc[idx, "current"] = row["current"]
             out.loc[idx, "protocol_frequency_hz"] = row["frequency"]
+            out.loc[idx, "pulse_width_ms"] = float(row["pulse_width"])
 
     return out
 
@@ -299,10 +328,8 @@ def laser_pulse_blocks(pulse_times_s, gap_factor: float = 3.0) -> list[tuple]:
 # latency/jitter/reliability exports added by Ali Mohebi. This is the
 # "standard" SALT variant (Dan's pipeline calls it salt_method="salt"), as
 # opposed to Dan's own resampled_median_js / pooled_shuffle alternatives,
-# which this port deliberately does not reproduce.
-
-DEFAULT_SALT_PARAMS = {"win_ms": 10.0, "bin_ms": 1.0, "baseline_span_ms": 150.0,
-                       "baseline_guard_ms": 10.0}
+# which this port deliberately does not reproduce. The baseline / test windows
+# follow compute_laser_window_metrics_v2.m (see compute_laser_response).
 
 
 def _build_salt_rasters(spike_times_s: np.ndarray, pulse_times_s: np.ndarray, *,
@@ -343,8 +370,11 @@ def _build_salt_rasters(spike_times_s: np.ndarray, pulse_times_s: np.ndarray, *,
     n_trials = pulse_times_s.size
     baseline_raster = np.zeros((n_trials, n_baseline_bins), dtype=bool)
     test_raster = np.zeros((n_trials, n_win_bins), dtype=bool)
+    first_edge, last_edge = min(baseline_edges[0], test_edges[0]), max(baseline_edges[-1], test_edges[-1])
     for i, t0 in enumerate(pulse_times_s):
-        rel = spike_times_s - t0
+        # only the spikes that can land in either raster (spike_times_s is sorted)
+        lo, hi = np.searchsorted(spike_times_s, [t0 + first_edge, t0 + last_edge], side="left")
+        rel = spike_times_s[lo:hi + 1] - t0
         baseline_raster[i] = np.histogram(rel, baseline_edges)[0] > 0
         test_raster[i] = np.histogram(rel, test_edges)[0] > 0
 
@@ -367,53 +397,57 @@ def _first_spike_bin_per_window(raster: np.ndarray, n_bins_per_window: int) -> n
     return out
 
 
-def _kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
-    support = p > 0
-    if np.any(q[support] <= 0):
-        return np.inf
-    return float(np.sum(p[support] * np.log(p[support] / (q[support] + np.finfo(float).eps))))
-
-
-def _js_sqrt_divergence(p: np.ndarray, q: np.ndarray) -> float:
+def _pairwise_js_sqrt_divergence(histograms: np.ndarray) -> np.ndarray:
+    """
+    sqrt(KL(p, m) + KL(q, m)), m = (p + q) / 2, for every pair of rows of
+    ``histograms`` (salt_DE.m's sqrt(2 * JSdiv); KL with eps in the
+    denominator as in its KLdist). Returns a (k, k) matrix. m > 0 wherever p > 0
+    or q > 0, so KL is always finite.
+    """
+    p = histograms[:, None, :]
+    q = histograms[None, :, :]
     m = 0.5 * (p + q)
+    eps = np.finfo(float).eps
+    with np.errstate(divide="ignore", invalid="ignore"):
+        kl_p = np.where(p > 0, p * np.log(p / (m + eps)), 0.0).sum(axis=2)
+        kl_q = np.where(q > 0, q * np.log(q / (m + eps)), 0.0).sum(axis=2)
     # clip to 0: KL(p,m)+KL(q,m) is mathematically >= 0, but floating-point
     # cancellation can make it a tiny negative number when p ~= q, which would
     # otherwise make sqrt() emit nan
-    jsd = max(0.0, _kl_divergence(p, m) + _kl_divergence(q, m))
-    return float(np.sqrt(jsd))
+    return np.sqrt(np.maximum(0.0, kl_p + kl_q))
 
 
 def salt_test(spike_times_s, pulse_times_s, *, baseline_start_s: float, baseline_end_s: float,
-             test_start_s: float, win_s: float = 0.01, bin_s: float = 0.001):
+             test_start_s: float, win_s: float, bin_s: float = 0.001):
     """
     Stimulus-associated spike latency test (Kvitsiani et al. 2013), ported
     from salt_DE.m.
 
     Splits the baseline span into consecutive, non-overlapping ``win_s``-wide
-    windows, builds a first-spike-latency histogram for each one plus for the
-    single test window, measures pairwise distances between every pair of
-    histograms (sqrt(2x Jensen-Shannon divergence)), and compares the mean
-    test-vs-baseline distance against the null distribution of
-    baseline-vs-baseline distances.
+    windows (kept nearest ``baseline_end_s``), builds a first-spike-latency
+    histogram for each one plus for the single test window, measures pairwise
+    distances between every pair of histograms (sqrt(2x Jensen-Shannon
+    divergence)), and compares the mean test-vs-baseline distance against the
+    null distribution of baseline-vs-baseline distances.
 
     Parameters
     ----------
     spike_times_s, pulse_times_s : array-like, seconds
     baseline_start_s, baseline_end_s : float
-        Baseline span, in seconds relative to each pulse onset (e.g. -0.16 to
-        -0.01 for a 150 ms baseline ending 10 ms before the pulse).
+        Available baseline span, in seconds relative to each pulse onset.
     test_start_s : float
         Start of the test window relative to each pulse onset (e.g. 0.001 for
         a response window starting 1 ms after onset).
     win_s, bin_s : float
-        SALT window / bin width, seconds (default 10 ms / 1 ms).
+        SALT window / bin width, seconds (win_s = test-window length).
 
     Returns
     -------
     p_value, stat : float
-        Empirical p-value and the test statistic (mean test-vs-baseline
-        distance minus mean baseline-vs-baseline distance would be Idiff in
-        salt_DE.m; here ``stat`` is the raw mean test-vs-baseline distance).
+        Empirical p-value and salt_DE.m's Idiff: mean test-vs-baseline distance
+        minus mean baseline-vs-baseline distance.
+    n_baseline_windows : int
+        Number of complete baseline windows used.
     """
     spike_times_s = np.sort(np.asarray(spike_times_s, dtype=np.float64))
     pulse_times_s = np.asarray(pulse_times_s, dtype=np.float64)
@@ -435,68 +469,103 @@ def salt_test(spike_times_s, pulse_times_s, *, baseline_start_s: float, baseline
 
     kn = len(histograms)  # n_baseline_windows + 1 (the last one is the test window)
     distances = np.full((kn, kn), np.nan)
-    for k1 in range(kn):
-        for k2 in range(k1 + 1, kn):
-            distances[k1, k2] = _js_sqrt_divergence(histograms[k1], histograms[k2])
+    upper = np.triu_indices(kn, k=1)
+    distances[upper] = _pairwise_js_sqrt_divergence(np.asarray(histograms))[upper]
 
     null_distances = distances[:kn - 1, :kn - 1]
     null_distances = null_distances[np.isfinite(null_distances)]
     test_distance = float(np.nanmean(distances[:kn - 1, kn - 1]))
 
     if null_distances.size == 0 or not np.isfinite(test_distance):
-        return np.nan, np.nan
+        return np.nan, np.nan, n_baseline_windows
 
     p_value = float(np.sum(null_distances >= test_distance) / null_distances.size)
-    return p_value, test_distance
+    return p_value, test_distance - float(np.mean(null_distances)), n_baseline_windows
 
 
 # --------------------------------------------------------------------------- #
 # Per-unit laser response + optotagging classification
 # --------------------------------------------------------------------------- #
+#
+# Mirrors Dan's MATLAB pipeline as run with config/analysis/opto_1hz_salt.json:
+# plot_optotag_pdf_per_cell_v4.m -> compute_laser_window_metrics_v2.m
+# (p_method "salt") -> build_salt_rasters_exact.m + salt_DE.m, plus the
+# waveform-correlation check from extract_waveforms_from_raw_fast.m /
+# plot_optotag_pdf_per_cell_v4.m. Two deliberate differences: pulse onsets are
+# the lag-corrected ones from laser_events.csv, and the SALT baseline also
+# keeps clear of the previous pulse's offset artifact mask.
 
 DEFAULT_OPTOTAG_PARAMS = {
-    "response_window_ms": (1.0, 10.0),
+    "max_trials": 100,                     # first N pulses (in time) per (color, power) condition
+    "response_start_ms": 1.0,              # response window = [response_start_ms, pulse width]
     "artifact_blank_ms": (0.0, 1.0),
-    "salt_params": DEFAULT_SALT_PARAMS,
+    "salt_bin_ms": 1.0,
+    "salt_baseline_guard_ms": 10.0,        # baseline ends this long before each pulse
+    "post_off_ms": None,                   # laser-offset mask length after offset (preprocessing.json)
     "salt_alpha": 0.001,
     "min_reliability": 0.25,
     "min_responded": 10,
+    "require_wave_corr": True,
+    "min_wave_corr": 0.9,
+    "wave_corr_window_ms": (-0.35, 0.9),   # relative to the reference waveform's trough
+    "wave_evoked_window_ms": (1.0, 10.0),  # latency window for laser-evoked waveform spikes
+    "wave_max_spikes": 100,
+    "wave_n_pre": 20,                      # snippet samples before / after the spike sample
+    "wave_n_post": 41,
 }
 
 
-def compute_laser_response(spike_times_s, pulse_times_s, *,
-                           response_window_ms=(1.0, 10.0), artifact_blank_ms=(0.0, 1.0),
-                           salt_params: dict | None = None) -> dict:
+def compute_laser_response(spike_times_s, pulse_times_s, *, pulse_width_ms: float,
+                           post_off_ms: float, response_start_ms: float = 1.0,
+                           artifact_blank_ms=(0.0, 1.0), salt_bin_ms: float = 1.0,
+                           salt_baseline_guard_ms: float = 10.0) -> dict:
     """
-    Per-unit laser response metrics for one set of same-color pulses, ported
-    from compute_laser_window_metrics_v2.m (first-spike latency / reliability
-    / jitter) plus the salt_test above.
+    Per-unit laser response metrics for one set of same-condition pulses,
+    ported from compute_laser_window_metrics_v2.m (first-spike latency /
+    reliability / jitter) plus the salt_test above.
 
     Parameters
     ----------
     spike_times_s, pulse_times_s : array-like, seconds
-    response_window_ms : (start, end)
-        Window after pulse onset to look for the first response spike in,
-        e.g. (1, 10) ms — start at 1 ms to skip the masked artifact.
+    pulse_width_ms : float
+        Nominal pulse width; the response window is
+        [response_start_ms, pulse_width_ms] (inclusive) and the SALT test
+        window is [response_start_ms, pulse_width_ms) in salt_bin_ms bins.
+    post_off_ms : float
+        Length of the laser-offset artifact mask after each pulse offset
+        (preprocessing.json mask_laser_artifact.post_off_ms).
+    response_start_ms : float
+        Start of the response window, e.g. 1 ms to skip the onset mask.
     artifact_blank_ms : (start, end)
         Spikes whose latency falls in this interval are ignored (the first
         *un-blanked* spike in the response window is used instead); use (0, 0)
         to disable.
-    salt_params : dict | None
-        Overrides for DEFAULT_SALT_PARAMS (win_ms, bin_ms, baseline_span_ms,
-        baseline_guard_ms).
+    salt_bin_ms : float
+        SALT bin width.
+    salt_baseline_guard_ms : float
+        The baseline ends this long before each pulse, and starts at least this
+        long after the previous one.
+
+    The available SALT baseline is
+    [-min_IPI + max(guard, response end, pulse_width + post_off_ms), -guard]:
+    as in compute_laser_window_metrics_v2.m, except that the shortest
+    inter-pulse interval (not the median) is used and the previous pulse's
+    offset mask is avoided, so no baseline window overlaps any masked data.
 
     Returns
     -------
     dict with n_trials, n_responded, reliability, latency_ms, median_latency_ms,
-    jitter_ms, salt_p, salt_stat, first_latency_ms (per-trial, ms, nan = no response).
+    jitter_ms, salt_p, salt_stat, n_baseline_windows, baseline_start_ms,
+    first_latency_ms (per-trial, ms, nan = no response).
     """
-    salt_params = {**DEFAULT_SALT_PARAMS, **(salt_params or {})}
     spike_times_s = np.sort(np.asarray(spike_times_s, dtype=np.float64))
-    pulse_times_s = np.asarray(pulse_times_s, dtype=np.float64)
+    pulse_times_s = np.sort(np.asarray(pulse_times_s, dtype=np.float64))
     n_trials = int(pulse_times_s.size)
 
-    resp_start_s, resp_end_s = (np.asarray(response_window_ms, dtype=np.float64) / 1000.0)
+    if pulse_width_ms <= response_start_ms:
+        raise ValueError(f"pulse_width_ms ({pulse_width_ms}) must exceed response_start_ms "
+                         f"({response_start_ms})")
+    resp_start_s, resp_end_s = response_start_ms / 1000.0, pulse_width_ms / 1000.0
     blank_start_s, blank_end_s = (np.asarray(artifact_blank_ms, dtype=np.float64) / 1000.0)
 
     first_latency_ms = np.full(n_trials, np.nan)
@@ -521,51 +590,194 @@ def compute_laser_response(spike_times_s, pulse_times_s, *,
         "reliability": n_responded / n_trials if n_trials else np.nan,
         "latency_ms": float(np.mean(valid)) if n_responded else np.nan,
         "median_latency_ms": float(np.median(valid)) if n_responded else np.nan,
-        "jitter_ms": float(np.std(valid)) if n_responded >= 2 else (0.0 if n_responded == 1 else np.nan),
+        # MATLAB std(x, 0): sample standard deviation
+        "jitter_ms": float(np.std(valid, ddof=1)) if n_responded >= 2 else (0.0 if n_responded == 1 else np.nan),
         "salt_p": np.nan,
         "salt_stat": np.nan,
+        "n_baseline_windows": 0,
+        "baseline_start_ms": np.nan,
         "first_latency_ms": first_latency_ms,
     }
 
     if n_trials >= 5:
-        baseline_end_s = -salt_params["baseline_guard_ms"] / 1000.0
-        baseline_start_s = baseline_end_s - salt_params["baseline_span_ms"] / 1000.0
-        try:
-            result["salt_p"], result["salt_stat"] = salt_test(
+        win_ms = pulse_width_ms - response_start_ms
+        min_ipi_ms = float(np.min(np.diff(pulse_times_s))) * 1000.0
+        guard_after_previous_ms = max(salt_baseline_guard_ms, pulse_width_ms, pulse_width_ms + post_off_ms)
+        baseline_start_ms = -min_ipi_ms + guard_after_previous_ms
+        baseline_end_ms = -salt_baseline_guard_ms
+        if baseline_end_ms - baseline_start_ms >= 2 * win_ms:
+            p, stat, n_windows = salt_test(
                 spike_times_s, pulse_times_s,
-                baseline_start_s=baseline_start_s, baseline_end_s=baseline_end_s,
-                test_start_s=resp_start_s,
-                win_s=salt_params["win_ms"] / 1000.0, bin_s=salt_params["bin_ms"] / 1000.0)
-        except ValueError:
-            pass  # not enough clean baseline — leave salt_p/salt_stat as nan
+                baseline_start_s=baseline_start_ms / 1000.0, baseline_end_s=baseline_end_ms / 1000.0,
+                test_start_s=resp_start_s, win_s=win_ms / 1000.0, bin_s=salt_bin_ms / 1000.0)
+            result.update(salt_p=p, salt_stat=stat, n_baseline_windows=n_windows,
+                          baseline_start_ms=baseline_end_ms - n_windows * win_ms)
+        else:
+            warnings.warn(f"not enough clean inter-pulse baseline: available "
+                          f"{baseline_end_ms - baseline_start_ms:.3f} ms, need at least {2 * win_ms:.3f} ms")
 
     return result
+
+
+def spike_tag_passes(response: dict, *, salt_alpha: float = 0.001,
+                     min_reliability: float = 0.25, min_responded: int = 10) -> tuple[bool, bool]:
+    """
+    (salt_pass, response_pass) for one compute_laser_response result, per
+    compute_laser_window_metrics_v2.m: SALT p-value below salt_alpha; enough
+    reliable responses.
+    """
+    salt_pass = bool(np.isfinite(response["salt_p"]) and response["salt_p"] < salt_alpha)
+    response_pass = bool(np.isfinite(response["reliability"])
+                         and response["reliability"] >= min_reliability
+                         and response["n_responded"] >= min_responded)
+    return salt_pass, response_pass
 
 
 def is_optotagged(response: dict, *, salt_alpha: float = 0.001,
                   min_reliability: float = 0.25, min_responded: int = 10) -> bool:
     """
-    Classify one compute_laser_response result as opto-tagged: SALT p-value
-    below salt_alpha AND enough reliable responses, per
-    compute_laser_window_metrics_v2.m's Metr.is_tag_candidate.
+    Spike-time part of the opto-tag decision (SALT and response criteria both
+    pass); the waveform check is applied separately in
+    compute_population_opto_response.
     """
-    salt_pass = np.isfinite(response["salt_p"]) and response["salt_p"] < salt_alpha
-    response_pass = (np.isfinite(response["reliability"])
-                     and response["reliability"] >= min_reliability
-                     and response["n_responded"] >= min_responded)
-    return bool(salt_pass and response_pass)
+    return all(spike_tag_passes(response, salt_alpha=salt_alpha, min_reliability=min_reliability,
+                                min_responded=min_responded))
+
+
+# --------------------------------------------------------------------------- #
+# Waveform check (session vs laser-evoked mean waveform)
+# --------------------------------------------------------------------------- #
+
+def read_kilosort_params(kilosort_path) -> dict:
+    """
+    Read a Kilosort/Phy ``params.py`` (plain literal assignments) without
+    executing it. ``dat_path`` is resolved to an absolute Path (first entry,
+    relative paths taken relative to the Kilosort folder).
+    """
+    kilosort_path = Path(kilosort_path)
+    params = {}
+    for node in ast.parse((kilosort_path / "params.py").read_text()).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            params[node.targets[0].id] = ast.literal_eval(node.value)
+    dat_path = params["dat_path"]
+    dat_path = Path(dat_path[0] if isinstance(dat_path, (list, tuple)) else dat_path)
+    params["dat_path"] = dat_path if dat_path.is_absolute() else (kilosort_path / dat_path).resolve()
+    return params
+
+
+def _waveform_pearson(x: np.ndarray, y: np.ndarray, mask: np.ndarray) -> float:
+    """Pearson r of x and y over mask (nan if fewer than 5 samples or zero variance)."""
+    x, y = x[mask], y[mask]
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid] - x[valid].mean(), y[valid] - y[valid].mean()
+    if x.size < 5:
+        return np.nan
+    denom = np.sqrt(np.sum(x ** 2) * np.sum(y ** 2))
+    return float(np.sum(x * y) / denom) if denom > 0 else np.nan
+
+
+def compute_waveform_correlation(sorting: BaseSorting, laser_events: pd.DataFrame, dat_path,
+                                 n_chan: int, *, params: dict | None = None,
+                                 bit_volts: float = 0.195, return_waveforms: bool = False,
+                                 progress_bar: bool = True):
+    """
+    Waveform check from Dan's pipeline: Pearson correlation between each
+    unit's reference mean waveform and its laser-evoked mean waveform, per
+    laser colour, on the unit's Phy peak channel of the raw (unfiltered) binary.
+
+    - Reference: up to ``wave_max_spikes`` evenly spaced spikes from all of the
+      unit's spikes.
+    - Evoked (per colour): spikes whose latency after the most recent pulse of
+      that colour (all pulses of the colour, every power) lies in
+      ``wave_evoked_window_ms`` (inclusive), up to ``wave_max_spikes`` evenly
+      spaced.
+    - r is computed over ``wave_corr_window_ms`` around the reference
+      waveform's trough; ``wave_pass`` = r >= ``min_wave_corr`` (nan fails).
+
+    Parameters
+    ----------
+    sorting : spikeinterface BaseSorting
+        Concatenated-axis sorting with a ``ch`` property (Phy cluster_info.tsv).
+    laser_events : pandas.DataFrame
+        Pulses in the same sample coordinates (on_sample_concat), one probe.
+    dat_path : Path
+        The binary Kilosort ran on (see read_kilosort_params). Opened read-only.
+    n_chan : int
+        Channels per sample in dat_path.
+    params : dict | None
+        Overrides for DEFAULT_OPTOTAG_PARAMS (wave_* keys, min_wave_corr).
+    bit_volts : float
+        int16 -> uV (r is scale-invariant; only affects returned waveforms).
+    return_waveforms : bool
+        Also return {unit_id: {"t_ms": ..., "reference": ..., <color>: ...}}.
+    progress_bar : bool
+        Show a per-unit progress bar.
+
+    Returns
+    -------
+    pandas.DataFrame, one row per (unit_id, color), sorted by unit_id:
+    wave_channel, n_wave_ref, n_wave_evoked, wave_corr, wave_pass  [, waveforms dict]
+    """
+    params = {**DEFAULT_OPTOTAG_PARAMS, **(params or {})}
+    if "ch" not in sorting.get_property_keys():
+        raise ValueError("sorting has no 'ch' property (Phy cluster_info.tsv) for the peak channel")
+
+    fs = sorting.get_sampling_frequency()
+    dat = open_raw_binary(dat_path, n_chan)
+    n_pre, n_post = params["wave_n_pre"], params["wave_n_post"]
+    max_n = params["wave_max_spikes"]
+    evoked_lo_ms, evoked_hi_ms = params["wave_evoked_window_ms"]
+
+    pulses_by_color = {c: np.sort(g["on_sample_concat"].to_numpy(dtype=np.int64))
+                       for c, g in laser_events.groupby("color")}
+    channels = dict(zip(sorting.unit_ids, sorting.get_property("ch")))
+
+    rows, waveforms = [], {}
+    for unit_id in tqdm(sorted(sorting.unit_ids), desc="waveform check", unit="unit",
+                        disable=not progress_bar):
+        spikes = sorting.get_unit_spike_train(unit_id).astype(np.int64)
+        channel = int(channels[unit_id])
+        reference, n_ref = mean_raw_waveform(dat, evenly_spaced(spikes, max_n), channel, n_pre, n_post, bit_volts)
+        if reference is not None:
+            t_ms = (np.arange(reference.size) - int(np.argmin(reference))) / fs * 1000.0
+            corr_mask = (t_ms >= params["wave_corr_window_ms"][0]) & (t_ms <= params["wave_corr_window_ms"][1])
+            waveforms[unit_id] = {"t_ms": t_ms, "reference": reference}
+
+        for color, pulses in pulses_by_color.items():
+            k = np.searchsorted(pulses, spikes, side="right") - 1      # most recent pulse of this colour
+            has_prev = k >= 0
+            latency_ms = np.full(spikes.size, np.nan)
+            latency_ms[has_prev] = (spikes[has_prev] - pulses[k[has_prev]]) / fs * 1000.0
+            evoked = spikes[has_prev & (latency_ms >= evoked_lo_ms) & (latency_ms <= evoked_hi_ms)]
+
+            wave_corr, n_evoked = np.nan, 0
+            if reference is not None:
+                evoked_mean, n_evoked = mean_raw_waveform(dat, evenly_spaced(evoked, max_n), channel,
+                                                      n_pre, n_post, bit_volts)
+                if evoked_mean is not None:
+                    wave_corr = _waveform_pearson(reference, evoked_mean, corr_mask)
+                    waveforms[unit_id][color] = evoked_mean
+            rows.append({"unit_id": unit_id, "color": color, "wave_channel": channel,
+                         "n_wave_ref": n_ref, "n_wave_evoked": n_evoked, "wave_corr": wave_corr,
+                         "wave_pass": bool(np.isfinite(wave_corr) and wave_corr >= params["min_wave_corr"])})
+
+    df = pd.DataFrame(rows)
+    return (df, waveforms) if return_waveforms else df
 
 
 def compute_population_opto_response(sorting: BaseSorting, laser_events: pd.DataFrame, *,
-                                     params: dict | None = None,
-                                     by=("color", "power")) -> pd.DataFrame:
+                                     params: dict | None = None, wave_df: pd.DataFrame | None = None,
+                                     by=("color", "power"), verbose: bool = True,
+                                     progress_bar: bool = True) -> pd.DataFrame:
     """
-    Run compute_laser_response + is_optotagged for every (unit, pulse group).
+    Run compute_laser_response for every (unit, pulse group) and classify.
 
     Pulses are grouped by ``by`` — by default (color, power), so **each laser
-    power level is tested for significance separately** (different neurons can
-    respond at different powers, and pooling all powers dilutes both the SALT
-    test and the reliability estimate).
+    power level is tested for significance separately** — and only the first
+    ``max_trials`` pulses (in time) of each group are used.
+
+    A (unit, group) is tagged when SALT passes, the response criteria pass, and
+    (if ``require_wave_corr``) the unit's waveform check for that colour passes.
 
     Parameters
     ----------
@@ -574,26 +786,35 @@ def compute_population_opto_response(sorting: BaseSorting, laser_events: pd.Data
         laser_events' on_sample_concat (e.g. the unsliced, concatenated-axis
         sorting from load_curated_sorting — not a per-session frame_slice).
     laser_events : pandas.DataFrame
-        As returned by load_laser_events, ideally after
-        annotate_laser_events_with_protocol (which adds the ``power`` column).
+        From load_laser_events after annotate_laser_events_with_protocol
+        (needs ``power`` and ``pulse_width_ms``).
     params : dict | None
-        Overrides for DEFAULT_OPTOTAG_PARAMS (response_window_ms,
-        artifact_blank_ms, salt_params, salt_alpha, min_reliability,
-        min_responded).
+        Overrides for DEFAULT_OPTOTAG_PARAMS; ``post_off_ms`` must be given.
+    wave_df : pandas.DataFrame | None
+        From compute_waveform_correlation; required if ``require_wave_corr``.
     by : sequence of str
-        laser_events columns to group pulses by. Entries missing from
-        laser_events are dropped (so this still works on un-annotated events,
-        falling back to ("color",)).
+        laser_events columns to group pulses by (missing columns are dropped).
+    verbose : bool
+        Print each group's pulse count, rate, and width.
+    progress_bar : bool
+        Show a progress bar over all (group, unit) pairs.
 
     Returns
     -------
-    pandas.DataFrame, one row per (unit_id, <by...>): every compute_laser_response
-    field, plus unit_id, the ``by`` columns, ``is_tagged`` (this group passed),
-    and ``color_tagged`` — True if the unit is tagged for at least one group
-    that shares this colour (i.e. "tagged for a colour if tagged at >= 1 of its
-    power levels").
+    pandas.DataFrame, one row per (unit_id, <by...>), sorted by unit_id (groups
+    in laser-delivery order within a unit): every compute_laser_response
+    field, pulse_width_ms, salt_pass, response_pass, the waveform columns,
+    ``is_tagged`` (this group passed), and ``color_tagged`` — True if the unit
+    is tagged for at least one group sharing this colour.
     """
     params = {**DEFAULT_OPTOTAG_PARAMS, **(params or {})}
+    if params["post_off_ms"] is None:
+        raise ValueError("params['post_off_ms'] is required (preprocessing.json "
+                         "probes.<probe>.mask_laser_artifact.post_off_ms)")
+    if "pulse_width_ms" not in laser_events.columns:
+        raise ValueError("laser_events has no pulse_width_ms column — run annotate_laser_events_with_protocol")
+    if params["require_wave_corr"] and wave_df is None:
+        raise ValueError("require_wave_corr is True but no wave_df was given")
     fs = sorting.get_sampling_frequency()
 
     by = [c for c in by if c in laser_events.columns]
@@ -603,23 +824,50 @@ def compute_population_opto_response(sorting: BaseSorting, laser_events: pd.Data
     spike_trains = {u: sorting.get_unit_spike_train(u).astype(np.float64) / fs
                     for u in sorting.unit_ids}
 
-    rows = []
+    groups = []   # (group_key, pulse_width_ms, pulse_times_s), in laser-delivery order
     for group_key, group_events in laser_events.groupby(by, sort=False):
         group_key = group_key if isinstance(group_key, tuple) else (group_key,)
-        pulse_times_s = group_events["on_sample_concat"].to_numpy(dtype=np.float64) / fs
-        for unit_id in sorting.unit_ids:
+        group_events = group_events.sort_values("on_sample_concat")
+        widths = group_events["pulse_width_ms"].unique()
+        if len(widths) != 1 or not np.isfinite(widths[0]):
+            raise ValueError(f"group {group_key}: expected one pulse width, got {widths}")
+        pulse_width_ms = float(widths[0])
+        pulse_times_s = group_events["on_sample_concat"].to_numpy(dtype=np.float64)[:params["max_trials"]] / fs
+        groups.append((group_key, pulse_width_ms, pulse_times_s))
+        if verbose:
+            rate_hz = 1.0 / np.median(np.diff(pulse_times_s)) if pulse_times_s.size >= 2 else np.nan
+            print(f"{dict(zip(by, group_key))}: {len(group_events)} pulses, using {pulse_times_s.size} | "
+                  f"rate {rate_hz:.3f} Hz | pulse width {pulse_width_ms:g} ms")
+    groups.sort(key=lambda g: g[2][0])
+
+    unit_ids = sorted(sorting.unit_ids)
+    rows = []
+    progress = tqdm(total=len(groups) * len(unit_ids), desc="laser response", unit="unit",
+                    disable=not progress_bar)
+    for unit_id in unit_ids:
+        for group_key, pulse_width_ms, pulse_times_s in groups:
+            progress.update()
             response = compute_laser_response(
-                spike_trains[unit_id], pulse_times_s,
-                response_window_ms=params["response_window_ms"],
-                artifact_blank_ms=params["artifact_blank_ms"],
-                salt_params=params["salt_params"])
-            tagged = is_optotagged(response, salt_alpha=params["salt_alpha"],
-                                   min_reliability=params["min_reliability"],
-                                   min_responded=params["min_responded"])
-            rows.append({"unit_id": unit_id, **dict(zip(by, group_key)), "is_tagged": tagged,
-                        **{k: v for k, v in response.items() if k != "first_latency_ms"}})
+                spike_trains[unit_id], pulse_times_s, pulse_width_ms=pulse_width_ms,
+                post_off_ms=params["post_off_ms"], response_start_ms=params["response_start_ms"],
+                artifact_blank_ms=params["artifact_blank_ms"], salt_bin_ms=params["salt_bin_ms"],
+                salt_baseline_guard_ms=params["salt_baseline_guard_ms"])
+            salt_pass, response_pass = spike_tag_passes(
+                response, salt_alpha=params["salt_alpha"], min_reliability=params["min_reliability"],
+                min_responded=params["min_responded"])
+            rows.append({"unit_id": unit_id, **dict(zip(by, group_key)), "pulse_width_ms": pulse_width_ms,
+                         "salt_pass": salt_pass, "response_pass": response_pass,
+                         **{k: v for k, v in response.items() if k != "first_latency_ms"}})
+
+    progress.close()
 
     df = pd.DataFrame(rows)
+    if wave_df is not None:
+        df = df.merge(wave_df[["unit_id", "color", "wave_corr", "wave_pass", "n_wave_evoked"]],
+                      on=["unit_id", "color"], how="left")
+        df["wave_pass"] = df["wave_pass"].fillna(False).astype(bool)
+    wave_ok = df["wave_pass"] if params["require_wave_corr"] else True
+    df["is_tagged"] = df["salt_pass"] & df["response_pass"] & wave_ok
     if "color" in df.columns:
         df["color_tagged"] = df.groupby(["unit_id", "color"])["is_tagged"].transform("any")
     else:

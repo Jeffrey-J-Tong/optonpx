@@ -35,7 +35,18 @@ from src.optotagging import (
     salt_test,
     compute_laser_response,
     is_optotagged,
+    spike_tag_passes,
+    read_kilosort_params,
+    compute_waveform_correlation,
     compute_population_opto_response,
+)
+from src.waveform import (
+    open_raw_binary,
+    mean_raw_waveform,
+    waveform_features,
+    classify_waveform_box,
+    compute_unit_waveform_features,
+    classify_putative_spn,
 )
 from src.metadata import (
     load_session_metadata,

@@ -1,3 +1,5 @@
+import warnings
+
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -840,9 +842,9 @@ def plot_probe_survey_interactive(electrodes, metric="peak_to_peak", title=None,
 # --------------------------------------------------------------------------- #
 
 def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
-                       window_ms=(-20.0, 30.0), bin_ms=1.0,
-                       response_window_ms=(1.0, 10.0), artifact_blank_ms=(0.0, 1.0),
-                       mark_blocks=True, block_gap_factor=3.0, psth_mode="stacked"):
+                       window_ms=(-20.0, 30.0), bin_ms=1.0, params=None,
+                       mark_blocks=True, block_gap_factor=3.0, psth_mode="stacked",
+                       drop_masked_spikes=False, mask_params=None):
     """
     Laser-onset-aligned spike raster (top) + PSTH(s) (below) for one unit, one
     column per laser colour.
@@ -864,9 +866,13 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
         Time window around each pulse onset to show.
     bin_ms : float
         PSTH bin width.
-    response_window_ms, artifact_blank_ms : (start, end)
-        Shaded on every panel; also passed to ``compute_laser_response`` for the
-        per-block reliability / SALT p annotations.
+    params : dict
+        The same overrides of ``src.optotagging.DEFAULT_OPTOTAG_PARAMS`` passed to
+        ``compute_population_opto_response`` (``post_off_ms`` is required), so
+        the per-block reliability / SALT p annotations match the tagging
+        decision. The response window [response_start_ms, pulse width] and
+        ``artifact_blank_ms`` are shaded on every panel. ``laser_events`` needs
+        the ``pulse_width_ms`` column.
     mark_blocks : bool
         Split the pulse train into blocks (power levels from the protocol
         annotation, else pulse-rate blocks from
@@ -879,15 +885,56 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
         as coloured step histograms in a single PSTH; "pooled" = a single PSTH
         over all pulses of the colour. Ignored (always pooled) if there is only
         one block.
+    drop_masked_spikes : bool
+        Display only: hide spikes that fall inside any laser artifact-mask
+        window (onset [-pre_on_ms, +post_on_ms], offset [-pre_off_ms,
+        +post_off_ms], sample-exact as SpikeInterface remove_artifacts, every
+        pulse in ``laser_events``) from the raster / PSTH, with a warning giving
+        the count. Kilosort assigns such spikes times inside interpolated data
+        (mis-timed spikes just after the mask, or detections caused by the mask
+        boundary). The reliability / SALT p annotations always use all spikes,
+        as the tagging decision does. Default False.
+    mask_params : dict | None
+        Required with drop_masked_spikes: notebook 2.2's mask parameters,
+        preprocessing.json ``probes.<probe>.mask_laser_artifact``.
 
     Returns
     -------
     matplotlib Figure
     """
-    from src.optotagging import compute_laser_response, laser_pulse_blocks
+    from src.optotagging import DEFAULT_OPTOTAG_PARAMS, compute_laser_response, laser_pulse_blocks
 
+    params = {**DEFAULT_OPTOTAG_PARAMS, **(params or {})}
+    if params["post_off_ms"] is None:
+        raise ValueError("params['post_off_ms'] is required (same params as compute_population_opto_response)")
     fs = sorting.get_sampling_frequency()
+
+    def pulse_width_of(color):
+        widths = laser_events.loc[laser_events["color"] == color, "pulse_width_ms"].unique()
+        if len(widths) != 1:
+            raise ValueError(f"{color}: expected one pulse width, got {widths}")
+        return float(widths[0])
     spike_times_s = sorting.get_unit_spike_train(unit_id).astype(float) / fs
+    display_spike_times_s = spike_times_s       # raster / PSTH only; annotations use spike_times_s
+    if drop_masked_spikes:
+        if mask_params is None:
+            raise ValueError("drop_masked_spikes=True needs mask_params "
+                             "(preprocessing.json probes.<probe>.mask_laser_artifact)")
+        spike_samples = sorting.get_unit_spike_train(unit_id).astype(np.int64)
+        in_mask = np.zeros(spike_samples.size, dtype=bool)
+        for column, pre_key, post_key in [("on_sample_concat", "pre_on_ms", "post_on_ms"),
+                                          ("off_sample_concat", "pre_off_ms", "post_off_ms")]:
+            edges = np.sort(laser_events[column].to_numpy(dtype=np.int64))
+            starts = edges - int(mask_params[pre_key] * fs / 1000.0)
+            ends = edges + int(mask_params[post_key] * fs / 1000.0)        # inclusive
+            k = np.searchsorted(starts, spike_samples, side="right") - 1
+            has = k >= 0
+            in_mask[has] |= spike_samples[has] <= ends[k[has]]
+        n_dropped = int(in_mask.sum())
+        if n_dropped:
+            warnings.warn(f"unit {unit_id}: {n_dropped} spike(s) inside laser artifact-mask windows hidden "
+                          f"from the raster/PSTH (display only; the tagging analysis still uses them)")
+        display_spike_times_s = spike_times_s[~in_mask]
 
     if colors is None:
         colors = list(laser_events["color"].unique())
@@ -921,10 +968,16 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
                              gridspec_kw={"height_ratios": height_ratios})
     psth_axes = []
 
-    def block_response(pulse_subset_s):
-        return compute_laser_response(spike_times_s, pulse_subset_s,
-                                      response_window_ms=response_window_ms,
-                                      artifact_blank_ms=artifact_blank_ms)
+    def block_response(pulse_subset_s, color, cap=True):
+        # per block: first max_trials pulses, as in compute_population_opto_response
+        pulses = pulse_subset_s[:params["max_trials"]] if cap else pulse_subset_s
+        return compute_laser_response(spike_times_s, pulses,
+                                      pulse_width_ms=pulse_width_of(color),
+                                      post_off_ms=params["post_off_ms"],
+                                      response_start_ms=params["response_start_ms"],
+                                      artifact_blank_ms=params["artifact_blank_ms"],
+                                      salt_bin_ms=params["salt_bin_ms"],
+                                      salt_baseline_guard_ms=params["salt_baseline_guard_ms"])
 
     def psth_rate(latencies_list):
         allm = np.concatenate(latencies_list) if latencies_list else np.array([])
@@ -934,7 +987,8 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
     for ci, color in enumerate(colors):
         ce, pt, blocks = per_color[color]
         per_trial_ms = [
-            (spike_times_s[(spike_times_s >= t0 + lo_s) & (spike_times_s < t0 + hi_s)] - t0) * 1000.0
+            (display_spike_times_s[(display_spike_times_s >= t0 + lo_s)
+                                   & (display_spike_times_s < t0 + hi_s)] - t0) * 1000.0
             for t0 in pt
         ]
 
@@ -957,7 +1011,7 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
                 psth_axes.append(ax)
                 ax.bar(edges_ms[:-1], psth_rate(per_trial_ms[start_idx:end_idx]),
                        width=bin_ms, align="edge", color="0.4")
-                mb = block_response(pt[start_idx:end_idx])
+                mb = block_response(pt[start_idx:end_idx], color)
                 ax.set_ylabel(f"{label or f'block {bi}'}\nHz", fontsize=8)
                 ax.text(0.98, 0.92, f"reliab {mb['reliability']:.2f} | p {mb['salt_p']:.2g}",
                         transform=ax.transAxes, ha="right", va="top", fontsize=7, color="0.35")
@@ -969,7 +1023,7 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
             if psth_mode == "overlay" and len(blocks) > 1:
                 ramp = plt.cm.viridis(np.linspace(0.1, 0.9, len(blocks)))
                 for bi, (start_idx, end_idx, label) in enumerate(blocks):
-                    mb = block_response(pt[start_idx:end_idx])
+                    mb = block_response(pt[start_idx:end_idx], color)
                     ax_p.step(edges_ms[:-1], psth_rate(per_trial_ms[start_idx:end_idx]),
                               where="post", color=ramp[bi], lw=1.3,
                               label=f"{label or bi}  (r {mb['reliability']:.2f}, p {mb['salt_p']:.2g})")
@@ -981,7 +1035,7 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
 
         axes[-1, ci].set_xlabel("time from laser onset (ms)")
 
-        m = block_response(pt)
+        m = block_response(pt, color, cap=False)
         ax_r.set_title(
             f"unit {unit_id} \u2014 {color}"
             + ("  (per-power PSTHs below)" if len(blocks) > 1 and (stacked or psth_mode == "overlay")
@@ -990,13 +1044,16 @@ def plot_opto_response(sorting, laser_events, unit_id, *, colors=None,
             fontsize=9,
         )
 
-    for ax in axes.ravel():
-        if not ax.get_visible() or not ax.axison:
-            continue
-        ax.axvspan(*response_window_ms, color="tab:blue", alpha=0.12, lw=0)
-        if artifact_blank_ms[1] > artifact_blank_ms[0]:
-            ax.axvspan(*artifact_blank_ms, color="tab:red", alpha=0.15, lw=0)
-        ax.axvline(0, color="tab:blue", lw=0.8)
+    artifact_blank_ms = params["artifact_blank_ms"]
+    for ci, color in enumerate(colors):
+        response_window_ms = (params["response_start_ms"], pulse_width_of(color))
+        for ax in axes[:, ci]:
+            if not ax.get_visible() or not ax.axison:
+                continue
+            ax.axvspan(*response_window_ms, color="tab:blue", alpha=0.12, lw=0)
+            if artifact_blank_ms[1] > artifact_blank_ms[0]:
+                ax.axvspan(*artifact_blank_ms, color="tab:red", alpha=0.15, lw=0)
+            ax.axvline(0, color="tab:blue", lw=0.8)
     if psth_axes:
         ymax = max((ax.get_ylim()[1] for ax in psth_axes), default=1.0)
         for ax in psth_axes:
