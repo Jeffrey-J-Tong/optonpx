@@ -57,6 +57,7 @@ from src.preprocess import (
     phase_shift_chunk,
     detect_laser_pulses,
     estimate_artifact_lag,
+    select_artifact_channel,
     build_mask_windows,
     apply_ramp_mask,
     write_concatenated_recording,

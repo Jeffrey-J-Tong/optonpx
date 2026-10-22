@@ -241,6 +241,107 @@ def estimate_artifact_lag(dat_path, probe_ts: np.ndarray, n_chan: int,
     return float(np.nanmedian(lags)), lags
 
 
+def select_artifact_channel(dat_path, probe_ts: np.ndarray, n_chan: int,
+                            pulse_on_t: np.ndarray, bad_channels=(),
+                            search_window_ms=(-5.0, 8.0), n_pulses: int = 50,
+                            top_fraction: float = 0.25, min_t_value: float = 5.0,
+                            probe_channel=None) -> dict:
+    """
+    Pick the probe channel used by ``estimate_artifact_lag`` from the
+    pulse-triggered average of every channel.
+
+    For up to ``n_pulses`` evenly spaced onsets, every channel is read within
+    ``search_window_ms`` of the onset, baseline-subtracted (median of the
+    pre-onset part) and averaged across pulses. Per channel:
+
+    - ``amplitude``: largest |average| in the window (raw int16 units)
+    - ``sign``     : sign of the average at that time (+1 / -1)
+    - ``t_value``  : amplitude / standard error across pulses at that time --
+      the artifact amplitude varies a lot from pulse to pulse (laser power),
+      so this measures how reliably the artifact is there, not its size.
+
+    Eligible channels are not in ``bad_channels``, never hit the int16 limits
+    and have ``t_value >= min_t_value``. Among the eligible channels with the
+    largest ``top_fraction`` of amplitudes, the one with the highest t value is
+    chosen (avoids picking a single outlier channel by amplitude alone).
+
+    If ``probe_channel`` is given (e.g. from the metadata) it is returned
+    instead, with its statistics, and nothing is raised.
+
+    The probe binary is opened read-only.
+
+    Returns
+    -------
+    dict with ``channel``, ``artifact_sign`` ('negative' / 'positive'),
+    ``source`` ('auto' / 'metadata'), ``amplitude``, ``t_value``, ``peak_ms``,
+    ``eligible`` (bool) for the chosen channel, and the per-channel arrays
+    ``amplitudes``, ``t_values``, ``signs``, ``eligible_mask``, plus
+    ``mean_traces`` (time x channel) and ``t_ms`` for QC plots.
+    """
+    probe_ts = np.asarray(probe_ts, dtype=np.float64)
+    fs = 1.0 / np.median(np.diff(probe_ts))
+    src = np.memmap(Path(dat_path), dtype="int16", mode="r").reshape(-1, int(n_chan))
+    n_t = src.shape[0]
+
+    pulses = np.asarray(pulse_on_t, dtype=np.float64)
+    if pulses.size > n_pulses:
+        pulses = pulses[np.round(np.linspace(0, pulses.size - 1, n_pulses)).astype(int)]
+
+    n_pre = int(round(abs(search_window_ms[0]) / 1000.0 * fs))
+    n_post = int(round(search_window_ms[1] / 1000.0 * fs))
+    t_ms = (np.arange(-n_pre, n_post + 1) / fs) * 1000.0
+
+    segments = []
+    saturated = np.zeros(int(n_chan), dtype=bool)
+    for pt in pulses:
+        c = _nearest_sample(probe_ts, pt, n_t)
+        i1, i2 = c - n_pre, c + n_post
+        if i1 < 0 or i2 >= n_t:
+            continue
+        seg = np.asarray(src[i1:i2 + 1])
+        saturated |= ((seg == np.iinfo(np.int16).min) | (seg == np.iinfo(np.int16).max)).any(axis=0)
+        segments.append(seg.astype(np.float64))
+    if len(segments) < 2:
+        raise ValueError(f"select_artifact_channel: only {len(segments)} usable pulses")
+    segments = np.stack(segments)                                   # pulse x time x channel
+    segments -= np.median(segments[:, :n_pre], axis=1, keepdims=True)
+
+    mean_traces = segments.mean(axis=0)
+    channels = np.arange(int(n_chan))
+    peak_index = np.abs(mean_traces).argmax(axis=0)
+    peak_values = mean_traces[peak_index, channels]
+    amplitudes = np.abs(peak_values)
+    signs = np.sign(peak_values).astype(int)
+    sem = segments[:, peak_index, channels].std(axis=0, ddof=1) / np.sqrt(len(segments))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_values = np.where(sem > 0, amplitudes / sem, 0.0)         # flat channels -> 0
+
+    is_bad = np.isin(channels, np.asarray(list(bad_channels), dtype=int))
+    eligible_mask = ~is_bad & ~saturated & (t_values >= min_t_value)
+
+    if probe_channel is not None:
+        channel, source = int(probe_channel), "metadata"
+    else:
+        candidates = channels[eligible_mask]
+        if candidates.size == 0:
+            raise ValueError(
+                f"select_artifact_channel: no channel has a reliable laser artifact "
+                f"(t >= {min_t_value}, not bad, not saturated) -- set "
+                f"preprocess.mask_laser_artifact.probe_channel in the metadata")
+        n_top = max(1, int(np.ceil(top_fraction * candidates.size)))
+        top = candidates[np.argsort(-amplitudes[candidates])[:n_top]]
+        channel, source = int(top[np.argmax(t_values[top])]), "auto"
+
+    return dict(
+        channel=channel, source=source,
+        artifact_sign="negative" if signs[channel] < 0 else "positive",
+        amplitude=float(amplitudes[channel]), t_value=float(t_values[channel]),
+        peak_ms=float(t_ms[peak_index[channel]]), eligible=bool(eligible_mask[channel]),
+        n_pulses=len(segments), amplitudes=amplitudes, t_values=t_values, signs=signs,
+        eligible_mask=eligible_mask, mean_traces=mean_traces, t_ms=t_ms,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Mask windows + application
 # --------------------------------------------------------------------------- #
