@@ -57,10 +57,11 @@ from src.preprocess import (
     phase_shift_chunk,
     detect_laser_pulses,
     estimate_artifact_lag,
-    select_artifact_channel,
+    estimate_common_mode_lag,
     build_mask_windows,
     apply_ramp_mask,
     write_concatenated_recording,
+    write_recording_sequential,
 )
 from src.region_map import (
     BRAIN_REGIONS,

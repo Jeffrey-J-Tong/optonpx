@@ -23,7 +23,7 @@
 
 ### 5. 次要事项（可选）
 
-**5a. Thomas 的两类"违规"计数（只用于报告和作图，不影响判定）**
+**5a. Thomas 的两类 " 违规 " 计数（只用于报告和作图，不影响判定）**
 
 - `wfViol`：p < 0.001 且 reliability > 0.02，但波形相关 < 0.9（光诱发波形和 session 平均波形不像）。
 - `relViol`：p < 0.001，但 reliability < 0.03（SALT 显著但响应太少）。
@@ -31,10 +31,10 @@
 - 用于论文 Fig 1E/F：p 值分布中排除这两类 unit；"untagged SPN" 的潜伏期分布也排除这两类。
 - 4.2 中可以直接从 `optotagging_summary.csv` 的现有列计算（`salt_p`、`reliability`、`wave_corr`、`is_tagged`），不需要重新跑分析。
 
-**5b. "未评估" ≠ 阴性（Dan）**
+**5b. " 未评估 " ≠ 阴性（Dan）**
 
 - Dan 的 `build_single_sort_unit_build.m` 把缺少 opto 指标的 unit 标为 `not_opto_evaluated` / `pMSN_not_opto_evaluated`，不当作 untagged。
-- 4.2 会对所有加载的 unit 都做评估，目前不存在这个问题。但如果以后改变 unit 筛选，或者合并多个 session，要注意区分"没评估"和"评估了但没通过"。
+- 4.2 会对所有加载的 unit 都做评估，目前不存在这个问题。但如果以后改变 unit 筛选，或者合并多个 session，要注意区分 " 没评估 " 和 " 评估了但没通过 "。
 
 **5c. 潜伏期 / jitter 上限**
 
@@ -45,4 +45,4 @@
 
 
 
-关于通过波形对神经元类型进行分类: 问题在于有些位置比较特殊的neurons的波形计算波宽有问题
+关于通过波形对神经元类型进行分类: 问题在于有些位置比较特殊的 neurons 的波形计算波宽有问题

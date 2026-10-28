@@ -15,8 +15,15 @@ Artifact masking (pulse detection, ADC->probe lag estimation, narrow linear-ramp
 mask) reproduces the Berke lab optotagging pipeline
 (matlab/load_laser_pulses_from_oe_adc.m, estimate_laser_artifact_lag_from_L.m,
 mask_probe_dat_artifacts.m).
+
+``write_recording_sequential`` writes any recording object with ``get_traces``
+(e.g. a SpikeInterface preprocessing chain) to an int16 binary, appending in order.
 """
 
+import multiprocessing
+import os
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -191,6 +198,9 @@ def estimate_artifact_lag(dat_path, probe_ts: np.ndarray, n_chan: int,
     Estimate the delay between a laser pulse onset (as timestamped on the ADC
     stream) and the artifact appearing in the probe data.
 
+    Not used by notebook 2.1 any more (see ``estimate_common_mode_lag``); kept
+    as the reference port of the Berke lab MATLAB code.
+
     Port of ``estimate_laser_artifact_lag_from_L.m``: for up to ``max_pulses``
     onsets, take the time of the extreme value (min for ``artifact_sign
     ='negative'``) on ``probe_channel`` within ``search_window_ms`` of the onset,
@@ -241,105 +251,62 @@ def estimate_artifact_lag(dat_path, probe_ts: np.ndarray, n_chan: int,
     return float(np.nanmedian(lags)), lags
 
 
-def select_artifact_channel(dat_path, probe_ts: np.ndarray, n_chan: int,
-                            pulse_on_t: np.ndarray, bad_channels=(),
-                            search_window_ms=(-5.0, 8.0), n_pulses: int = 50,
-                            top_fraction: float = 0.25, min_t_value: float = 5.0,
-                            probe_channel=None) -> dict:
+def estimate_common_mode_lag(dat_path, probe_ts: np.ndarray, n_chan: int,
+                            pulse_on_t: np.ndarray, pulse_off_t=None, bad_channels=(),
+                            search_window_ms=(-5.0, 8.0), max_pulses: int = 200):
     """
-    Pick the probe channel used by ``estimate_artifact_lag`` from the
-    pulse-triggered average of every channel.
+    Estimate the delay between a laser pulse onset (as timestamped on the ADC
+    stream) and the artifact in the probe data, from all good channels at once.
 
-    For up to ``n_pulses`` evenly spaced onsets, every channel is read within
-    ``search_window_ms`` of the onset, baseline-subtracted (median of the
-    pre-onset part) and averaged across pulses. Per channel:
+    For up to ``max_pulses`` evenly spaced onsets, the broadband (raw int16)
+    first difference is taken on every good channel and the median over
+    channels is formed; the lag of that pulse is the time of its largest
+    absolute value within ``search_window_ms``, i.e. the steepest transient that
+    is common to the probe. The median over pulses is returned.
 
-    - ``amplitude``: largest |average| in the window (raw int16 units)
-    - ``sign``     : sign of the average at that time (+1 / -1)
-    - ``t_value``  : amplitude / standard error across pulses at that time --
-      the artifact amplitude varies a lot from pulse to pulse (laser power),
-      so this measures how reliably the artifact is there, not its size.
+    If ``pulse_off_t`` is given, the search of each pulse ends at half its width
+    after the onset, so that the offset artifact (e.g. at +7.8 ms for a 10 ms
+    pulse with a -2.2 ms lag) can never be taken for the onset artifact.
 
-    Eligible channels are not in ``bad_channels``, never hit the int16 limits
-    and have ``t_value >= min_t_value``. Among the eligible channels with the
-    largest ``top_fraction`` of amplitudes, the one with the highest t value is
-    chosen (avoids picking a single outlier channel by amplitude alone).
-
-    If ``probe_channel`` is given (e.g. from the metadata) it is returned
-    instead, with its statistics, and nothing is raised.
+    Unlike ``estimate_artifact_lag`` (one channel, time of the broadband
+    extremum) this does not depend on the artifact shape of a single channel:
+    channels where the light also causes a slow component have a later
+    broadband extremum, while the sharp common transient is simultaneous on all
+    channels. The sign of the artifact does not matter.
 
     The probe binary is opened read-only.
 
     Returns
     -------
-    dict with ``channel``, ``artifact_sign`` ('negative' / 'positive'),
-    ``source`` ('auto' / 'metadata'), ``amplitude``, ``t_value``, ``peak_ms``,
-    ``eligible`` (bool) for the chosen channel, and the per-channel arrays
-    ``amplitudes``, ``t_values``, ``signs``, ``eligible_mask``, plus
-    ``mean_traces`` (time x channel) and ``t_ms`` for QC plots.
+    median_lag_ms : float
+    per_pulse_ms  : (n_used,) array (nan for pulses too close to the file edges)
     """
     probe_ts = np.asarray(probe_ts, dtype=np.float64)
     fs = 1.0 / np.median(np.diff(probe_ts))
     src = np.memmap(Path(dat_path), dtype="int16", mode="r").reshape(-1, int(n_chan))
     n_t = src.shape[0]
+    good = np.setdiff1d(np.arange(int(n_chan)), np.asarray(list(bad_channels), dtype=int))
 
     pulses = np.asarray(pulse_on_t, dtype=np.float64)
-    if pulses.size > n_pulses:
-        pulses = pulses[np.round(np.linspace(0, pulses.size - 1, n_pulses)).astype(int)]
+    widths_ms = (np.full(pulses.size, np.inf) if pulse_off_t is None
+                 else (np.asarray(pulse_off_t, dtype=np.float64) - pulses) * 1000.0)
+    if pulses.size > max_pulses:
+        keep = np.round(np.linspace(0, pulses.size - 1, max_pulses)).astype(int)
+        pulses, widths_ms = pulses[keep], widths_ms[keep]
 
     n_pre = int(round(abs(search_window_ms[0]) / 1000.0 * fs))
-    n_post = int(round(search_window_ms[1] / 1000.0 * fs))
-    t_ms = (np.arange(-n_pre, n_post + 1) / fs) * 1000.0
-
-    segments = []
-    saturated = np.zeros(int(n_chan), dtype=bool)
-    for pt in pulses:
+    lags = np.full(pulses.size, np.nan)
+    for k, pt in enumerate(pulses):
+        n_post = int(round(min(search_window_ms[1], widths_ms[k] / 2) / 1000.0 * fs))
         c = _nearest_sample(probe_ts, pt, n_t)
         i1, i2 = c - n_pre, c + n_post
-        if i1 < 0 or i2 >= n_t:
+        if i1 < 1 or i2 >= n_t:
             continue
-        seg = np.asarray(src[i1:i2 + 1])
-        saturated |= ((seg == np.iinfo(np.int16).min) | (seg == np.iinfo(np.int16).max)).any(axis=0)
-        segments.append(seg.astype(np.float64))
-    if len(segments) < 2:
-        raise ValueError(f"select_artifact_channel: only {len(segments)} usable pulses")
-    segments = np.stack(segments)                                   # pulse x time x channel
-    segments -= np.median(segments[:, :n_pre], axis=1, keepdims=True)
+        seg = np.asarray(src[i1 - 1:i2 + 1, good], dtype=np.float64)
+        step = np.median(np.diff(seg, axis=0), axis=1)      # step[j]: sample i1 + j minus the one before
+        lags[k] = (int(np.argmax(np.abs(step))) - n_pre) / fs * 1000.0
 
-    mean_traces = segments.mean(axis=0)
-    channels = np.arange(int(n_chan))
-    peak_index = np.abs(mean_traces).argmax(axis=0)
-    peak_values = mean_traces[peak_index, channels]
-    amplitudes = np.abs(peak_values)
-    signs = np.sign(peak_values).astype(int)
-    sem = segments[:, peak_index, channels].std(axis=0, ddof=1) / np.sqrt(len(segments))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t_values = np.where(sem > 0, amplitudes / sem, 0.0)         # flat channels -> 0
-
-    is_bad = np.isin(channels, np.asarray(list(bad_channels), dtype=int))
-    eligible_mask = ~is_bad & ~saturated & (t_values >= min_t_value)
-
-    if probe_channel is not None:
-        channel, source = int(probe_channel), "metadata"
-    else:
-        candidates = channels[eligible_mask]
-        if candidates.size == 0:
-            raise ValueError(
-                f"select_artifact_channel: no channel has a reliable laser artifact "
-                f"(t >= {min_t_value}, not bad, not saturated) -- set "
-                f"preprocess.mask_laser_artifact.probe_channel in the metadata")
-        n_top = max(1, int(np.ceil(top_fraction * candidates.size)))
-        top = candidates[np.argsort(-amplitudes[candidates])[:n_top]]
-        channel, source = int(top[np.argmax(t_values[top])]), "auto"
-
-    return dict(
-        channel=channel, source=source,
-        artifact_sign="negative" if signs[channel] < 0 else "positive",
-        amplitude=float(amplitudes[channel]), t_value=float(t_values[channel]),
-        peak_ms=float(t_ms[peak_index[channel]]), eligible=bool(eligible_mask[channel]),
-        n_pulses=len(segments), amplitudes=amplitudes, t_values=t_values, signs=signs,
-        eligible_mask=eligible_mask, mean_traces=mean_traces, t_ms=t_ms,
-    )
+    return float(np.nanmedian(lags)), lags
 
 
 # --------------------------------------------------------------------------- #
@@ -523,3 +490,116 @@ def write_concatenated_recording(session_probe_infos, output_path, *,
             cursor += n
 
     return per_session
+
+
+# --------------------------------------------------------------------------- #
+# Sequential binary writer
+# --------------------------------------------------------------------------- #
+
+_writer_recording = None   # the recording of a writer worker process
+
+
+def _init_writer_worker(recording):
+    global _writer_recording
+    _writer_recording = recording
+
+
+def _writer_chunk(start_frame: int, end_frame: int) -> np.ndarray:
+    from threadpoolctl import threadpool_limits   # one BLAS/FFT thread per worker, as SpikeInterface
+    with threadpool_limits(limits=1):
+        traces = _writer_recording.get_traces(start_frame=start_frame, end_frame=end_frame)
+    return np.ascontiguousarray(traces.astype("int16", copy=False))
+
+
+def write_recording_sequential(recording, output_path, *, n_jobs: int = 4,
+                               chunk_duration_s: float = 2.0, sync_every_bytes: int = 2**30,
+                               progress_bar: bool = True) -> int:
+    """
+    Write a single-segment recording (any object with ``get_traces``, e.g. a
+    SpikeInterface chain) to an int16 binary, time x channel, appending chunk by
+    chunk from the start of the file.
+
+    Why not ``spikeinterface.core.write_binary_recording``: it first sizes the file
+    by writing one byte at its end. On Windows exFAT / NTFS this makes the file
+    system fill the whole file with zeros (165 GB per probe for a 2 h session)
+    before or while the data are written; on a USB hard disk that took over an hour
+    per probe and blocked the drive (2026-09-03). Appending never writes past the
+    end of the data, so nothing is zero-filled.
+
+    ``n_jobs`` worker processes compute the chunks (``get_traces``) in parallel and
+    the calling process writes them in order; at most ``2 * n_jobs`` chunks are
+    computed ahead, so memory stays bounded when the disk is slower than the
+    computation. ``n_jobs = 1`` computes in the calling process. The file is
+    flushed to disk every ``sync_every_bytes``.
+
+    Chunks are ``chunk_duration_s`` long whatever ``n_jobs`` is, so the output does
+    not depend on ``n_jobs``. With the default 2 s the bytes are identical to
+    ``write_binary_recording(..., chunk_duration="2s")`` (the phase shift depends
+    on the chunk length by up to a few int16 units).
+
+    Workers are started with ``spawn`` on every OS. From a ``.py`` script, call this
+    under ``if __name__ == "__main__":``, otherwise each worker re-runs the script.
+
+    Returns the number of bytes written.
+    """
+    output_path = Path(output_path)
+    n_samples = recording.get_num_samples()
+    step = int(chunk_duration_s * recording.get_sampling_frequency())
+    bounds = [(start, min(start + step, n_samples)) for start in range(0, n_samples, step)]
+    total_bytes = n_samples * recording.get_num_channels() * 2
+
+    bar = None
+    if progress_bar:
+        from tqdm.auto import tqdm
+        bar = tqdm(total=total_bytes, unit="B", unit_scale=True, unit_divisor=1024,
+                   desc=f"write {output_path.name}")
+
+    written = unsynced = 0
+    with open(output_path, "wb") as out:
+        def append(traces):
+            nonlocal written, unsynced
+            out.write(traces.tobytes())
+            written += traces.nbytes
+            unsynced += traces.nbytes
+            if unsynced >= sync_every_bytes:
+                out.flush()
+                os.fsync(out.fileno())
+                unsynced = 0
+            if bar is not None:
+                bar.update(traces.nbytes)
+
+        try:
+            if n_jobs <= 1:
+                for start, end in bounds:
+                    append(np.ascontiguousarray(
+                        recording.get_traces(start_frame=start, end_frame=end).astype("int16", copy=False)))
+            else:
+                with ProcessPoolExecutor(max_workers=n_jobs, mp_context=multiprocessing.get_context("spawn"),
+                                         initializer=_init_writer_worker, initargs=(recording,)) as pool:
+                    remaining = iter(bounds)
+                    pending = deque()
+                    for _ in range(2 * n_jobs):
+                        chunk = next(remaining, None)
+                        if chunk is None:
+                            break
+                        pending.append(pool.submit(_writer_chunk, *chunk))
+                    try:
+                        while pending:
+                            traces = pending.popleft().result()
+                            chunk = next(remaining, None)
+                            if chunk is not None:
+                                pending.append(pool.submit(_writer_chunk, *chunk))
+                            append(traces)
+                    except BaseException:
+                        for future in pending:
+                            future.cancel()
+                        raise
+            out.flush()
+            os.fsync(out.fileno())
+        finally:
+            if bar is not None:
+                bar.close()
+
+    if written != total_bytes:
+        raise RuntimeError(f"{output_path}: wrote {written} bytes, expected {total_bytes}")
+    return written

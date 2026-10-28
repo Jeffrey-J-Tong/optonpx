@@ -1,0 +1,52 @@
+animal: D1-1-6_IM-1979
+date: 2026-09-17
+
+sessions:
+  behavior:    "2026-09-17_14-16-02"
+  optotagging: "2026-09-17_15-32-27"
+  processed:   "2026-09-17"
+
+streams:
+  probes:
+    - probeB
+  adc: OneBox-ADC
+
+adc:
+  threshold_volts: 2
+  channels:
+    sync:       0
+    blue_laser: 1
+    behavior:   2
+    red_laser:  3
+
+probeB:
+  target:
+    region: "NAc"
+  preprocess:
+    concatenate: ["behavior", "optotagging"]
+    phase_shift:
+      apply: true
+      margin_ms: 40                   # FFT edge context per chunk
+      chunk_s: 10                     # samples per streamed chunk (tune for RAM)
+    mask_laser_artifact:
+      apply: true
+      pre_on_ms:  0.1
+      post_on_ms: 1.0
+      pre_off_ms: 0.1
+      post_off_ms: 1.0
+      method: linear        # linear | zero
+    car:
+      apply: false
+    mask_noise_artifact:              # common-mode noise detection + mask (notebook 2.1)
+      apply: true
+      threshold_mad: 8.0              # per-channel threshold, in MAD of the 300 Hz high-passed signal
+      min_fraction: 0.5               # fraction of good channels over threshold at the same sample
+      min_slope_mad: 4.0              # only sharp events (slope >= this) are masked
+      pre_ms: 0.5
+      post_ms: 1.0
+      max_optotagging_events: 10      # more events in the optotagging session -> 2.1 stops
+  kilosort_params:
+    bad_channels: [0, 2, 10, 54, 55, 58, 131, 218, 240, 324, 325]   # 0: DC offset at the top of the range, clipped part of the time
+    do_car: true
+    # any other Kilosort 4 setting can be added here by name, e.g. Th_universal: 8 (notebook 2.3)
+    output_dir: kilosort4

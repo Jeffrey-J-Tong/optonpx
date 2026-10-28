@@ -41,7 +41,7 @@ probeA:
   kilosort_params:
     bad_channels: [6, 32, 90, 121, 137, 251]
     do_car: true
-    Th: []
+    # any other Kilosort 4 setting can be added here by name, e.g. Th_universal: 8 (notebook 2.3)
     output_dir: kilosort4
 
 probeB:
@@ -63,7 +63,7 @@ probeB:
     car:
       apply: false
   kilosort_params:
-    bad_channels: [2, 10, 54, 131, 218, 240]
+    bad_channels: [0, 2, 10, 54, 131, 218, 240]   # 0: DC offset at the top of the range, clipped part of the time
     do_car: true
-    Th: []
+    # any other Kilosort 4 setting can be added here by name, e.g. Th_universal: 8 (notebook 2.3)
     output_dir: kilosort4

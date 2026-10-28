@@ -41,7 +41,7 @@ probeA:
   kilosort_params:
     bad_channels: [6, 32, 72, 90, 121, 137]
     do_car: true
-    Th: []
+    # any other Kilosort 4 setting can be added here by name, e.g. Th_universal: 8 (notebook 2.3)
     output_dir: kilosort4
 
 probeB:
@@ -63,5 +63,5 @@ probeB:
   kilosort_params:
     bad_channels: [2, 10, 54, 131]
     do_car: true
-    Th: []
+    # any other Kilosort 4 setting can be added here by name, e.g. Th_universal: 8 (notebook 2.3)
     output_dir: kilosort4
