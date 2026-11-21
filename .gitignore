@@ -8,3 +8,7 @@ references
 **/todo_*
 **/old_*
 ENVIRONMENT.md
+logs/
+metadata/*
+!metadata/README.md
+notebook/Mariana/

@@ -37,7 +37,7 @@ OPENEPHYS_AMPLITUDE_CMAP = mcolors.LinearSegmentedColormap.from_list(
 )
 
 
-def plot_electrode_map(channel_electrode=None, title=None):
+def plot_electrode_map(channel_electrode=None, title=None, all_banks=False):
     """
     Draw a channel map for one NP2.0 multi-shank probe.
 
@@ -47,6 +47,9 @@ def plot_electrode_map(channel_electrode=None, title=None):
         probe["channel_electrode"] from probes_params.
         If None, draws the full probe layout with all electrodes in gray
         (no active channels highlighted).
+    all_banks : bool
+        True: draw all banks. False: draw banks 0 up to the highest bank holding an active
+        channel, on every shank (ignored when channel_electrode is None: all banks are drawn).
 
     Returns
     -------
@@ -85,7 +88,7 @@ def plot_electrode_map(channel_electrode=None, title=None):
                     break
 
         active_banks  = sorted(set(ch_bank[ch] for ch in channels))
-        banks_to_draw = list(range(max(active_banks) + 1))
+        banks_to_draw = list(range(N_BANKS if all_banks else max(active_banks) + 1))
         norm          = mcolors.Normalize(vmin=min(channels), vmax=max(channels))
 
         active_elec = set()

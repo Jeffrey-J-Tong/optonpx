@@ -30,6 +30,7 @@ from src.optotagging import (
     split_sorting_by_session,
     load_laser_events,
     load_laser_protocol,
+    laser_protocol_from_metadata,
     annotate_laser_events_with_protocol,
     laser_pulse_blocks,
     salt_test,
@@ -68,4 +69,15 @@ from src.region_map import (
     build_region_assignment_app,
     save_region_assignment,
     load_region_assignment,
+)
+from src.depth_profile import (
+    DEFAULT_PARAMS as DEPTH_PROFILE_DEFAULT_PARAMS,
+    compute_depth_profile,
+    save_depth_profile,
+    load_depth_profile,
+    ypos_to_depth,
+    plot_depth_profile,
+    plot_shank_overview,
+    channel_metrics,
+    plot_probe_metric,
 )

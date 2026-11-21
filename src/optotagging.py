@@ -2,11 +2,12 @@
 Loading a Phy-curated Kilosort 4 sorting (via SpikeInterface) and slicing it
 back into the individual sessions that were concatenated before sorting
 (see src/preprocess.py write_concatenated_recording and
-notebook/2.2_concatenate_sessions_si.ipynb's session_boundaries.json), plus
+notebook/2.1_concatenate_sessions.ipynb's session_boundaries.json), plus
 laser-response / optotagging classification (SALT test).
 """
 
 import ast
+import io
 import operator
 import warnings
 from pathlib import Path
@@ -70,7 +71,7 @@ def load_curated_sorting(output_dir, probe_name: str, kilosort_dir: str = "kilos
     ----------
     output_dir : Path
         The processed-session directory containing one subfolder per probe
-        stream (as written by notebook 2.2_concatenate_sessions_si.ipynb).
+        stream (as written by notebook 2.1_concatenate_sessions.ipynb).
     probe_name : str
         Probe stream subfolder name, e.g. "probeA".
     kilosort_dir : str
@@ -133,7 +134,7 @@ def split_sorting_by_session(sorting: BaseSorting, sessions: list[dict]) -> dict
         Per-session boundary records with 'session_id', 'sample_start',
         'sample_end' — the "sessions" list under
         session_boundaries.json["streams"][probe_name], as written by
-        notebook 2.2_concatenate_sessions_si.ipynb.
+        notebook 2.1_concatenate_sessions.ipynb.
 
     Returns
     -------
@@ -157,7 +158,7 @@ def split_sorting_by_session(sorting: BaseSorting, sessions: list[dict]) -> dict
 def load_laser_events(output_dir, probe_name: str | None = None,
                       session_id: str | None = None) -> pd.DataFrame:
     """
-    Load laser_events.csv (written by notebook 2.2_concatenate_sessions[_si]).
+    Load laser_events.csv (written by notebook 2.1_concatenate_sessions).
 
     Each row is one masked laser pulse: probe, session, color,
     on_sample_concat/off_sample_concat (sample index into the *concatenated*
@@ -195,6 +196,56 @@ def load_laser_protocol(csv_path) -> pd.DataFrame:
     count, current (laser-driver mA), note_power (e.g. "5 mW"), note_wavelength.
     """
     return pd.read_csv(Path(csv_path))
+
+
+LASER_PROTOCOL_COLUMNS = ("color", "pulse_width", "frequency", "count", "current",
+                          "note_power", "note_wavelength")
+
+
+def laser_protocol_from_metadata(config: dict, session_key: str) -> pd.DataFrame:
+    """
+    The laser protocol of one optotagging session from the session metadata:
+    ``config["laser_protocol"][session_key]`` holds the protocol csv text pasted
+    as a YAML block (``|``), e.g.
+
+        laser_protocol:
+          optotagging: |
+            color,pulse_width,frequency,count,current,note_power,note_wavelength
+            blue,10,1,100,410,1 mW,473 nm
+
+    ``session_key`` is a key of ``config["sessions"]``. Returns the same table as
+    load_laser_protocol; raises if the block is missing or malformed.
+    """
+    protocols =config.get("laser_protocol") or {}
+    unknown = sorted(set(protocols) - set(config.get("sessions", {})))
+    if unknown:
+        raise ValueError(f"laser_protocol keys {unknown} are not session keys "
+                         f"(sessions: {sorted(config.get('sessions', {}))})")
+    if session_key not in protocols:
+        raise KeyError(f"no laser_protocol.{session_key} in the metadata "
+                       f"(laser_protocol keys: {sorted(protocols)})")
+    text = protocols[session_key]
+    if not isinstance(text, str):
+        raise ValueError(f"laser_protocol.{session_key} must be the csv text in a YAML block "
+                         f"('{session_key}: |' followed by the indented csv lines)")
+    protocol = pd.read_csv(io.StringIO(text), skipinitialspace=True)
+    if tuple(protocol.columns) != LASER_PROTOCOL_COLUMNS:
+        raise ValueError(f"laser_protocol.{session_key}: columns {list(protocol.columns)}, "
+                         f"expected {list(LASER_PROTOCOL_COLUMNS)}")
+    if protocol.empty:
+        raise ValueError(f"laser_protocol.{session_key} has no rows")
+    bad_colors = sorted(set(protocol["color"]) - set(_PROTOCOL_COLOR_TO_EVENT))
+    if bad_colors:
+        raise ValueError(f"laser_protocol.{session_key}: unknown colors {bad_colors} "
+                         f"(allowed: {sorted(_PROTOCOL_COLOR_TO_EVENT)})")
+    for column in ("pulse_width", "frequency", "count", "current"):
+        if not pd.api.types.is_numeric_dtype(protocol[column]) or protocol[column].isna().any():
+            raise ValueError(f"laser_protocol.{session_key}: column {column!r} must be numbers "
+                             f"in every row, got {protocol[column].tolist()}")
+    if (protocol["count"] <= 0).any() or (protocol["count"] % 1 != 0).any():
+        raise ValueError(f"laser_protocol.{session_key}: count must be positive integers, "
+                         f"got {protocol['count'].tolist()}")
+    return protocol
 
 
 def annotate_laser_events_with_protocol(laser_events: pd.DataFrame, protocol: pd.DataFrame, *,
