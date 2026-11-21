@@ -1,7 +1,42 @@
-numpy
-scipy
-pandas
-matplotlib
-ipywidgets
-jupyterlab
-pyyaml
+# OptoNPX: the `optonpx` environment (src/ and every notebook except 2.3).
+# Python 3.12. Versions are pinned to the working environment; upgrade on purpose by editing them.
+#
+#   with pip:
+#     conda create -n optonpx python=3.12 && conda activate optonpx && pip install -r requirements.txt
+#
+#   with uv (same conda env, much faster installs; uv only installs the packages):
+#     conda create -n optonpx python=3.12 && conda activate optonpx
+#     pip install uv
+#     uv pip install -r requirements.txt
+#
+# Not included: notebook 2.3 (run Kilosort) imports `kilosort`, which runs in its own
+# environment (Kilosort 4 + a CUDA build of PyTorch).
+
+# --- core ---
+numpy==2.4.4
+scipy==1.17.1
+pandas==2.3.3
+pyyaml==6.0.3               # metadata/*.yaml
+openpyxl==3.1.5             # src/probe.py: the channel-mapping spreadsheet
+tqdm==4.68.2
+threadpoolctl==3.6.0        # src/preprocess.py
+
+# --- spike sorting data (SpikeInterface) ---
+spikeinterface==0.104.5     # preprocessing (2.1), analyzer + metrics (4.1), read_phy (3.x)
+probeinterface==0.3.2       # 4.1: Kilosort probe geometry
+zarr==2.18.7                # 4.1: analyzer.zarr (SpikeInterface 0.104 needs zarr 2)
+numcodecs==0.15.1
+numba==0.65.1               # faster correlograms / metrics in SpikeInterface
+scikit-learn==1.7.2         # SpikeInterface quality metrics / bad-channel detection
+
+# --- plotting ---
+matplotlib==3.10.9
+bokeh==3.9.2                # interactive probe-survey plots (src/viz.py, notebook 1.1)
+panel==1.9.4                # src/region_map.py (notebook 3.1)
+
+# --- Jupyter ---
+jupyterlab==4.5.6
+ipykernel==7.2.0
+ipython==9.13.0
+ipywidgets==8.1.8
+papermill==2.7.0            # scripts/run_batch.py: runs the notebooks unattended
